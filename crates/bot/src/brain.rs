@@ -299,7 +299,7 @@ impl Default for Params {
             sn_maxp: 9.0,
             lj: 0.0,
             akl: 52.0,
-            akl_own: 0.0,
+            akl_own: 1.0,
             corner_d: 0.0,
             mlz: 1.0,
             lj_t0: 0.15,
