@@ -147,6 +147,8 @@ pub struct Params {
     pub farm_range: f32,
     pub engage_all: f32,
     pub drops: f32,
+    pub upg: f32,
+    pub magnet: f32,
 }
 
 impl Default for Params {
@@ -169,6 +171,8 @@ impl Default for Params {
             farm_range: 70.0,
             engage_all: 1.0,
             drops: 1.0,
+            upg: 0.0,
+            magnet: 50.0,
         }
     }
 }
@@ -199,6 +203,8 @@ impl Params {
                     "farm_range" => p.farm_range = x,
                     "engage_all" => p.engage_all = x,
                     "drops" => p.drops = x,
+                    "upg" => p.upg = x,
+                    "magnet" => p.magnet = x,
                     _ => eprintln!("unknown param {k}"),
                 }
             }
@@ -216,6 +222,31 @@ impl Params {
         }
     }
 }
+
+const UPGRADE_RANK_DPS: &[&str] = &[
+    "gun_rate",
+    "gun_damage",
+    "laser_damage",
+    "plating",
+    "laser_charge",
+    "armor",
+    "gun_mag",
+    "nanites",
+    "gyros",
+    "lightning_efficiency",
+    "lightning_range",
+    "gun_velocity",
+    "servos",
+    "capacitor",
+    "reactor",
+    "jets",
+    "sensors",
+    "lightning_chain",
+    "mortar_reload",
+    "mortar_velocity",
+    "mortar_splash",
+    "laser_pierce",
+];
 
 const UPGRADE_RANK: &[&str] = &[
     "plating",
@@ -594,8 +625,9 @@ impl Brain {
         // ---- upgrades
         if let Some(offer) = &obs.offer {
             let mut best = (usize::MAX, 0usize);
+            let rank = if self.prm.upg > 0.5 { UPGRADE_RANK_DPS } else { UPGRADE_RANK };
             for (i, c) in offer.choices.iter().enumerate() {
-                let r = UPGRADE_RANK.iter().position(|u| *u == c.id).unwrap_or(UPGRADE_RANK.len());
+                let r = rank.iter().position(|u| *u == c.id).unwrap_or(rank.len());
                 if r < best.0 {
                     best = (r, i);
                 }
@@ -1009,6 +1041,20 @@ impl Brain {
             }
             let g = self.roam_goal.unwrap().0;
             mv = self.goto(p2, g);
+        }
+
+        // Cube magnet: kills drop cubes (+4% HP and damage each); grab nearby ones even mid-fight.
+        if self.prm.magnet > 0.0 && matches!(mode, Mode::Fight | Mode::Farm | Mode::Cover) && !self.retreating {
+            if let Some(c) = obs
+                .cubes
+                .iter()
+                .filter(|c| hdist(c.pos, pos) < self.prm.magnet && dist2(xy(c.pos), gc) < gr + 5.0 && (c.pos[2] - pos[2]).abs() < 4.0)
+                .min_by(|a, b| hdist(a.pos, pos).partial_cmp(&hdist(b.pos, pos)).unwrap())
+            {
+                let to = self.goto(p2, xy(c.pos));
+                let w = if mode == Mode::Cover { 0.6 } else { 1.4 };
+                mv = unit2([mv[0] + to[0] * w, mv[1] + to[1] * w]);
+            }
         }
 
         // Laser dodge: an enemy charging at us with a clear line -> duck into nearby cover.
