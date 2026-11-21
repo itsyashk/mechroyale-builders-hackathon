@@ -95,9 +95,12 @@ pub struct Brain {
     mode: Mode,
     ticks: u64,
     debug: bool,
+    debug_every: u64,
     dodge_goal: Option<[f32; 2]>,
     dodge_check_t: f32,
     dodges: u32,
+    last_ttk: f32,
+    last_ttd: f32,
     // config numbers
     pickup_radius: f32,
     cube_radius: f32,
@@ -198,7 +201,10 @@ impl Brain {
             dodge_goal: None,
             dodge_check_t: -1.0,
             dodges: 0,
+            last_ttk: 0.0,
+            last_ttd: 0.0,
             debug: std::env::var("MECHBOT_DEBUG").is_ok(),
+            debug_every: std::env::var("MECHBOT_DEBUG").ok().and_then(|v| v.parse().ok()).unwrap_or(10).max(1),
         })
     }
 
@@ -539,15 +545,61 @@ impl Brain {
 
         // ---- fight or flight
         let tgt_hp = target_mech.as_ref().map(|t| t.0.hp.unwrap_or(1400.0)).unwrap_or(0.0);
-        let n_close = enemies.iter().filter(|m| hdist(m.pos, pos) < 120.0).count();
+        // Engagement estimate: our time-to-kill on the target vs time-to-die under fire.
+        let cube_mul = 1.0 + 0.04 * (me.cubes.min(10) as f32);
+        let tgt_d = target_mech.as_ref().map(|t| hdist(t.0.pos, pos)).unwrap_or(999.0);
+        let mut our_dps = 0.0;
+        if has("gun") {
+            our_dps += if tgt_d < 60.0 { 120.0 } else if tgt_d < 130.0 { 80.0 } else { 45.0 };
+        }
+        if have_laser {
+            our_dps += 120.0;
+        }
+        if have_light && tgt_d < 45.0 {
+            our_dps += 190.0;
+        }
+        if has("mortar") {
+            our_dps += 35.0;
+        }
+        our_dps *= cube_mul;
+        let me_c = [pos[0], pos[1], pos[2] + 4.5 * my_scale];
+        let mut their_dps = 0.0;
+        let mut n_shooting = 0;
+        for m in &enemies {
+            let d = hdist(m.pos, pos);
+            if d > 230.0 {
+                continue;
+            }
+            let sc = 1.0 + 0.05 * m.cubes.unwrap_or(0) as f32;
+            if !self.world.los(Self::eye_of(m.pos, sc), me_c) {
+                continue;
+            }
+            n_shooting += 1;
+            let mut e = if d < 60.0 { 110.0 } else if d < 130.0 { 80.0 } else { 50.0 };
+            if m.has("laser") {
+                e += 120.0;
+            }
+            if m.has("lightning") && d < 50.0 {
+                e += 180.0;
+            }
+            their_dps += e * (1.0 + 0.04 * (m.cubes.unwrap_or(0).min(10) as f32));
+        }
+        let recent_in: f32 = self.dmg_log.iter().filter(|d| obs.t - d.0 < 2.0).map(|d| d.3).sum::<f32>() / 2.0;
+        let incoming = their_dps.max(recent_in);
+        let ttk = tgt_hp / our_dps.max(1.0);
+        let ttd = me.hp / incoming.max(1.0);
+        self.last_ttk = ttk;
+        self.last_ttd = ttd;
         if self.retreating {
-            if hp_frac > 0.85 || enemies.is_empty() && obs.t - self.last_dmg_t > 12.0 {
+            let safe = hp_frac > 0.8 || enemies.is_empty() && obs.t - self.last_dmg_t > 10.0;
+            let cornered = tgt_d < 30.0 && ttk < ttd * 0.8;
+            if safe || cornered {
                 self.retreating = false;
             }
         } else if target_mech.is_some() {
-            let losing = hp_frac < 0.33 && tgt_hp > me.hp * 0.7;
-            let swarmed = n_close >= 3 && hp_frac < 0.6;
-            if losing || swarmed {
+            let losing = ttk > ttd * 0.85 && (hp_frac < 0.6 || n_shooting >= 2);
+            let low = hp_frac < 0.3 && tgt_hp > me.hp * 0.5;
+            if losing || low {
                 self.retreating = true;
                 self.cover_goal = None;
             }
@@ -557,6 +609,17 @@ impl Brain {
             .as_ref()
             .map(|(m, _)| m.has("laser") && !have_laser && hdist(m.pos, pos) > 85.0)
             .unwrap_or(false);
+        // Pick fights: engage when it attacks us, when it is close, or when we are healthy
+        // and favoured; otherwise slip away and heal.
+        let engage_ok = target_mech
+            .as_ref()
+            .map(|(m, _)| {
+                let attacking = attackers.contains(&m.id)
+                    || (wrap(m.aim[0] - yaw_to(xy(m.pos), p2)).abs() < 0.25 && hdist(m.pos, pos) < 120.0);
+                attacking || tgt_d < 35.0 || hp_frac > 0.65 && ttk < ttd * 0.8 && n_shooting <= 1
+            })
+            .unwrap_or(false);
+        let _avoid = target_mech.is_some() && !engage_ok;
 
         // ---- choose mode
         let mut mode;
@@ -721,9 +784,10 @@ impl Brain {
             }
             Mode::Cover => {
                 let away = target_mech.as_ref().map(|t| xy(t.0.pos));
+                let hit_now = obs.events.iter().any(|e| e.kind == "damaged" && e.by.map(|b| b < 100).unwrap_or(false));
                 let need_new = match self.cover_goal {
                     None => true,
-                    Some((_, t0)) => obs.t - t0 > 1.0,
+                    Some((c, t0)) => obs.t - t0 > 1.0 || hit_now && dist2(c, p2) < 2.0,
                 };
                 if need_new {
                     let c = self.find_cover(pos, &threat_eyes, (gc, gr), if self.retreating { away } else { None }, 40.0);
@@ -902,7 +966,10 @@ impl Brain {
         }
 
         // ---- boost with energy hysteresis (keep a reserve for lightning)
-        let reserve = if have_light { 25.0 } else { 12.0 };
+        let reserve = if have_light { 45.0 } else { 12.0 };
+        if have_light && mode == Mode::Fight && tgt_d < 50.0 {
+            want_boost = false;
+        }
         if self.boosting {
             if me.energy < reserve {
                 self.boosting = false;
@@ -968,11 +1035,11 @@ impl Brain {
         }
         self.mode = mode;
         let _ = my_scale;
-        if self.debug && self.ticks % 10 == 0 {
+        if self.debug && self.ticks % self.debug_every == 0 {
             eprintln!(
-                "t={:.1} {:?} hp={:.0}/{:.0} e={:.0} pos=({:.0},{:.0},{:.0}) tgt={:?} enemies={} w=[{},{}] cubes={} zone=({:.0},{:.0} r{:.0}) mv=({:.2},{:.2}) fire={:?} retreat={}",
+                "t={:.1} {:?} hp={:.0}/{:.0} e={:.0} pos=({:.0},{:.0},{:.0}) tgt={:?} enemies={} w=[{},{}] cubes={} zone=({:.0},{:.0} r{:.0}) mv=({:.2},{:.2}) fire={:?} retreat={} ttk={:.1} ttd={:.1}",
                 obs.t, mode, me.hp, max_hp, me.energy, pos[0], pos[1], pos[2], self.target_id, enemies.len(),
-                slot_kind(0), slot_kind(1), me.cubes, gc[0], gc[1], gr, act.mv[0], act.mv[1], act.fire, self.retreating
+                slot_kind(0), slot_kind(1), me.cubes, gc[0], gc[1], gr, act.mv[0], act.mv[1], act.fire, self.retreating, self.last_ttk, self.last_ttd
             );
         }
         if self.ticks % 5 == 0 {
