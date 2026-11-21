@@ -191,6 +191,7 @@ pub struct Params {
     pub sn_stay: f32,
     pub sn_loot: f32,
     pub sn_others: f32,
+    pub sn_cover: f32,
 }
 
 impl Default for Params {
@@ -241,6 +242,7 @@ impl Default for Params {
             sn_stay: 0.0,
             sn_loot: 0.0,
             sn_others: 40.0,
+            sn_cover: 0.0,
         }
     }
 }
@@ -299,6 +301,7 @@ impl Params {
                     "sn_stay" => p.sn_stay = x,
                     "sn_loot" => p.sn_loot = x,
                     "sn_others" => p.sn_others = x,
+                    "sn_cover" => p.sn_cover = x,
                     _ => eprintln!("unknown param {k}"),
                 }
             }
@@ -1422,7 +1425,7 @@ impl Brain {
             }
             self.sn_prev_charge = ch;
         }
-        if self.prm.sniper > 0.0 && mode == Mode::Fight {
+        if self.prm.sniper > 0.0 && (mode == Mode::Fight || self.prm.sn_cover > 0.0 && mode == Mode::Cover && hp_frac > 0.3) {
             if let (Some((m, _)), Some((ch, cd, full, lrange))) = (&target_mech, lz) {
                 let d = hdist(m.pos, pos);
                 let tsc = 1.0 + 0.05 * m.cubes.unwrap_or(0) as f32;
