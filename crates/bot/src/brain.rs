@@ -181,6 +181,7 @@ pub struct Brain {
     sn_tpos: [f32; 2],
     sn_fire_t: f32,
     sn_prev_charge: f32,
+    lq_full_t: f32,
     sn_active: bool,
     sn_stat: [u32; 4],
     duels: HashMap<i64, Duel>,
@@ -301,6 +302,9 @@ pub struct Params {
     pub mclus: f32,
     /// Target-score bonus (m) for mortar carriers while we hold a laser (cook-off).
     pub lcook: f32,
+    /// Laser quick release: 1 = fire lethal partial charges, release full charges on loose aim or after lq_hold s.
+    pub lq: f32,
+    pub lq_hold: f32,
     /// Remember out-of-view enemies for this many s (cover choice, threat estimate).
     pub memt: f32,
     pub nlr: f32,
@@ -374,6 +378,8 @@ impl Default for Params {
             lhold: 0.0,
             mclus: 0.0,
             lcook: 0.0,
+            lq: 1.0,
+            lq_hold: 0.4,
             memt: 0.0,
             nlr: 2.0,
             nlr_t: 90.0,
@@ -454,6 +460,8 @@ impl Params {
                     "lhold" => p.lhold = x,
                     "mclus" => p.mclus = x,
                     "lcook" => p.lcook = x,
+                    "lq" => p.lq = x,
+                    "lq_hold" => p.lq_hold = x,
                     "memt" => p.memt = x,
                     "nlr" => p.nlr = x,
                     "nlr_t" => p.nlr_t = x,
@@ -612,6 +620,7 @@ impl Brain {
             sn_tpos: [0.0, 0.0],
             sn_fire_t: -100.0,
             sn_prev_charge: 0.0,
+            lq_full_t: -1.0,
             sn_active: false,
             sn_stat: [0; 4],
             duels: HashMap::new(),
@@ -2454,7 +2463,31 @@ impl Brain {
                     }
                 }
                 let ready = charge >= full * self.prm.lrel.min(1.0) - 0.03;
-                if ready && los && aligned(direct) {
+                let mut quick = false;
+                if self.prm.lq > 0.0 {
+                    if charge >= full - 0.03 {
+                        if self.lq_full_t < 0.0 {
+                            self.lq_full_t = obs.t;
+                        }
+                    } else {
+                        self.lq_full_t = -1.0;
+                    }
+                    let loose = wrap(cur_aim[0] - direct[0]).abs() < 2.0 * tol_yaw && (cur_aim[1] - direct[1]).abs() < 2.0 * tol_pitch;
+                    let tm = obs.mechs.iter().find(|m| m.id == tg.id);
+                    let lethal = matches!(tg.kind, TargetKind::Mech)
+                        && charge >= 0.15
+                        && tm
+                            .and_then(|m| m.hp.map(|h| (h, m.has("mortar"))))
+                            .map(|(h, mortar)| {
+                                let est = lw.stat("damage", 315.0) * (1.0 + 0.04 * (me.cubes.min(10) as f32)) * (0.35 + 0.65 * (charge / full).min(1.0)) * if mortar { 1.6 } else { 1.0 };
+                                est >= h + 15.0
+                            })
+                            .unwrap_or(false);
+                    quick = (lethal && los && aligned(direct))
+                        || (ready && los && loose)
+                        || (ready && self.lq_full_t >= 0.0 && obs.t - self.lq_full_t > self.prm.lq_hold);
+                }
+                if ready && los && aligned(direct) || quick {
                     fire[li] = false; // release
                 } else {
                     fire[li] = true;
