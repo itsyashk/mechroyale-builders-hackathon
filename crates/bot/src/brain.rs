@@ -190,6 +190,15 @@ pub struct Brain {
     juke_src: i64,
     akl_prev: [f32; 2],
     ws: WStat,
+    /// Death instrumentation: (t, by, weapon, amount, rear, dist to attacker or -1).
+    dth_log: VecDeque<(f32, i64, String, f32, bool, f32)>,
+    /// (t, mode, retreating, kiting, hp, n visible enemies, n shooting)
+    dth_hist: VecDeque<(f32, Mode, bool, bool, f32, usize, usize)>,
+    kill_ts: Vec<f32>,
+    dth_kiting: bool,
+    dth_nshoot: usize,
+    dth_myw: String,
+    dth_cubes: i32,
     // config numbers
     pickup_radius: f32,
     cube_radius: f32,
@@ -292,6 +301,11 @@ pub struct Params {
     pub mclus: f32,
     /// Target-score bonus (m) for mortar carriers while we hold a laser (cook-off).
     pub lcook: f32,
+    /// Remember out-of-view enemies for this many s (cover choice, threat estimate).
+    pub memt: f32,
+    pub nlr: f32,
+    pub nlr_t: f32,
+    pub nlr_d: f32,
 }
 
 impl Default for Params {
@@ -360,6 +374,10 @@ impl Default for Params {
             lhold: 0.0,
             mclus: 0.0,
             lcook: 0.0,
+            memt: 0.0,
+            nlr: 0.0,
+            nlr_t: 90.0,
+            nlr_d: 35.0,
         }
     }
 }
@@ -436,6 +454,10 @@ impl Params {
                     "lhold" => p.lhold = x,
                     "mclus" => p.mclus = x,
                     "lcook" => p.lcook = x,
+                    "memt" => p.memt = x,
+                    "nlr" => p.nlr = x,
+                    "nlr_t" => p.nlr_t = x,
+                    "nlr_d" => p.nlr_d = x,
                     _ => eprintln!("unknown param {k}"),
                 }
             }
@@ -598,6 +620,13 @@ impl Brain {
             juke_src: -1,
             akl_prev: [0.0, 0.0],
             ws: WStat { on: std::env::var("MECHBOT_WSTAT").is_ok(), laser_t: -1.0, first_w2_t: -1.0, ..Default::default() },
+            dth_log: VecDeque::new(),
+            dth_hist: VecDeque::new(),
+            kill_ts: Vec::new(),
+            dth_kiting: false,
+            dth_nshoot: 0,
+            dth_myw: String::new(),
+            dth_cubes: 0,
             duel_on: std::env::var("MECHBOT_DUEL").is_ok(),
             debug: std::env::var("MECHBOT_DEBUG").is_ok(),
             gstat: [0; 7],
@@ -742,10 +771,71 @@ impl Brain {
             );
         }
         if self.duel_on {
+            self.death_line(raw);
             for (id, d) in &self.duels {
                 self.duel_close(*id, d, if self.t - d.last < 8.0 { "died" } else { "split" });
             }
         }
+    }
+
+    fn death_line(&self, raw: &str) {
+        let t = self.t;
+        let w = |dt: f32| self.dth_log.iter().filter(move |d| t - d.0 < dt);
+        let mut att5: Vec<i64> = w(5.0).filter(|d| d.1 >= 0 && d.1 < 100).map(|d| d.1).collect();
+        att5.sort();
+        att5.dedup();
+        let mut att10: Vec<i64> = w(10.0).filter(|d| d.1 >= 0 && d.1 < 100).map(|d| d.1).collect();
+        att10.sort();
+        att10.dedup();
+        let sumw = |k: &str| w(10.0).filter(|d| d.2 == k).map(|d| d.3).sum::<f32>();
+        let tot10: f32 = w(10.0).map(|d| d.3).sum();
+        let rear10: f32 = w(10.0).filter(|d| d.4).map(|d| d.3).sum();
+        let npc10: f32 = w(10.0).filter(|d| d.1 >= 100).map(|d| d.3).sum();
+        let zone10: f32 = w(10.0).filter(|d| d.1 < 0).map(|d| d.3).sum();
+        // top attacker over 10 s
+        let mut per: Vec<(i64, f32, f32)> = vec![];
+        for d in w(10.0).filter(|d| d.1 >= 0 && d.1 < 100) {
+            match per.iter_mut().find(|p| p.0 == d.1) {
+                Some(p) => {
+                    p.1 += d.3;
+                    if d.5 >= 0.0 {
+                        p.2 = d.5;
+                    }
+                }
+                None => per.push((d.1, d.3, d.5)),
+            }
+        }
+        per.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let top = per.first().cloned().unwrap_or((-1, 0.0, -1.0));
+        let topw = self.tracks.get(&top.0).map(|tr| tr.weapons.join("+")).unwrap_or_default();
+        let toph = self.tracks.get(&top.0).map(|tr| tr.hp).unwrap_or(-1.0);
+        let h10: Vec<_> = self.dth_hist.iter().filter(|h| t - h.0 < 10.0).collect();
+        let n = h10.len().max(1) as f32;
+        let fr = |f: &dyn Fn(&&(f32, Mode, bool, bool, f32, usize, usize)) -> bool| h10.iter().filter(|h| f(h)).count() as f32 / n;
+        let hpmax20 = self.dth_hist.iter().filter(|h| t - h.0 < 20.0).map(|h| h.4).fold(0.0f32, f32::max);
+        let hp10 = self.dth_hist.iter().find(|h| t - h.0 < 10.0).map(|h| h.4).unwrap_or(-1.0);
+        let fdmg = self.dth_log.iter().filter(|d| d.1 >= 0).map(|d| d.0).fold(1e9f32, f32::min);
+        let mut bursts = 0.0f32;
+        // time from the first hit of the final continuous engagement (no 5 s gap) to death
+        let mut eng0 = t;
+        for d in self.dth_log.iter().rev() {
+            if eng0 - d.0 > 5.0 {
+                break;
+            }
+            eng0 = d.0;
+            bursts += d.3;
+        }
+        let lastk = self.kill_ts.last().copied().unwrap_or(-1.0);
+        eprintln!(
+            "DEATH raw={} t={:.1} kills={} lastk={:.1} sincek={:.1} att5={} att10={} tot10={:.0} l={:.0} g={:.0} z={:.0} m={:.0} rear={:.0} npc={:.0} zone={:.0} top={} topdmg={:.0} topd={:.0} topw={} toph={:.0} mw={} cubes={} hpmax20={:.0} hp10={:.0} fight={:.2} cover={:.2} other={:.2} retr={:.2} kite={:.2} vis={:.1} shoot={:.1} eng={:.1} engdmg={:.0} firstdmg={:.1}",
+            raw.replace(' ', ""), t, self.kill_ts.len(), lastk, if lastk >= 0.0 { t - lastk } else { t }, att5.len(), att10.len(), tot10,
+            sumw("laser"), sumw("gun"), sumw("lightning"), sumw("mortar"), rear10, npc10, zone10,
+            top.0, top.1, top.2, if topw.is_empty() { "?".into() } else { topw }, toph, self.dth_myw, self.dth_cubes, hpmax20, hp10,
+            fr(&|h| h.1 == Mode::Fight), fr(&|h| h.1 == Mode::Cover), fr(&|h| h.1 != Mode::Fight && h.1 != Mode::Cover),
+            fr(&|h| h.2), fr(&|h| h.3),
+            h10.iter().map(|h| h.5 as f32).sum::<f32>() / n, h10.iter().map(|h| h.6 as f32).sum::<f32>() / n,
+            t - eng0, bursts, fdmg
+        );
     }
 
     // ------------------------------------------------------------------ helpers --------
@@ -1281,11 +1371,43 @@ impl Brain {
         if !self.allow_escape {
             self.escape_until = -1.0;
         }
-        let threat_eyes: Vec<V3> = enemies
+        let mut threat_eyes: Vec<V3> = enemies
             .iter()
             .filter(|m| hdist(m.pos, pos) < 260.0)
             .map(|m| Self::eye_of(m.pos, 1.0 + 0.05 * m.cubes.unwrap_or(0) as f32))
             .collect();
+        // Remembered threats: enemies out of our view cone (seen in the last `memt` s, dead
+        // reckoned) and unseen shooters placed along their damage bearing.
+        let mut mem_threats: Vec<(V3, Vec<String>, i32)> = vec![];
+        if self.prm.memt > 0.0 {
+            for (id, tr) in &self.tracks {
+                let dt = obs.t - tr.seen_t;
+                if dt < 0.01 || dt > self.prm.memt || enemies.iter().any(|m| m.id == *id) {
+                    continue;
+                }
+                let k = dt.min(1.5);
+                let p = [tr.pos[0] + tr.vel[0] * k, tr.pos[1] + tr.vel[1] * k, tr.pos[2]];
+                if hdist(p, pos) < 200.0 {
+                    mem_threats.push((p, tr.weapons.clone(), tr.cubes));
+                }
+            }
+            let mut done: Vec<i64> = vec![];
+            for d in self.dmg_log.iter().rev().filter(|d| obs.t - d.0 < 2.0) {
+                let Some(b) = d.2 else { continue };
+                if b >= 100 || done.contains(&b) || enemies.iter().any(|m| m.id == b) {
+                    continue;
+                }
+                done.push(b);
+                if self.tracks.get(&b).map(|tr| obs.t - tr.seen_t <= self.prm.memt).unwrap_or(false) {
+                    continue;
+                }
+                let p = [pos[0] + d.1.cos() * 50.0, pos[1] + d.1.sin() * 50.0, pos[2]];
+                mem_threats.push((p, vec!["gun".to_string()], 0));
+            }
+            for (p, _, c) in &mem_threats {
+                threat_eyes.push(Self::eye_of(*p, 1.0 + 0.05 * *c as f32));
+            }
+        }
 
         // Weapon inventory.
         let slot_kind = |i: usize| me.weapons.get(i).and_then(|w| w.as_ref()).map(|w| w.kind.as_str()).unwrap_or("");
@@ -1334,6 +1456,21 @@ impl Brain {
             }
             their_dps += e * (1.0 + 0.04 * (m.cubes.unwrap_or(0).min(10) as f32));
         }
+        for (mp, mw, mc) in &mem_threats {
+            let d = hdist(*mp, pos);
+            if d > 230.0 || !self.world.los(Self::eye_of(*mp, 1.0 + 0.05 * *mc as f32), me_c) {
+                continue;
+            }
+            n_shooting += 1;
+            let mut e = if d < 60.0 { 110.0 } else if d < 130.0 { 80.0 } else { 50.0 };
+            if mw.iter().any(|w| w == "laser") {
+                e += 120.0;
+            }
+            if mw.iter().any(|w| w == "lightning") && d < 50.0 {
+                e += 180.0;
+            }
+            their_dps += e * (1.0 + 0.04 * ((*mc).min(10) as f32));
+        }
         let recent_in: f32 = self.dmg_log.iter().filter(|d| obs.t - d.0 < 2.0).map(|d| d.3).sum::<f32>() / 2.0;
         let incoming = their_dps.max(recent_in);
         let ttk = tgt_hp / our_dps.max(1.0);
@@ -1380,6 +1517,19 @@ impl Brain {
                 let ae = self.tracks.get(&m.id).map(|t| t.aerr).unwrap_or(0.05);
                 let hurt = m.hp.unwrap_or(1400.0) < 0.5 * m.max_hp.unwrap_or(1400.0);
                 if !(attacking || tgt_d < 30.0 || ae > self.prm.pick_aerr || hurt) {
+                    target_mech = None;
+                    self.target_id = None;
+                }
+            }
+        }
+        // No-laser restraint: while we only have the gun, don't start fights with laser bots
+        // (nlr=1) or with anyone (nlr=2) that is not after us; keep looting for a laser instead.
+        if self.prm.nlr > 0.0 && !have_laser && obs.t < self.prm.nlr_t {
+            if let Some((m, _)) = &target_mech {
+                let attacking = attackers.contains(&m.id) || (wrap(m.aim[0] - yaw_to(xy(m.pos), p2)).abs() < 0.2 && hdist(m.pos, pos) < 120.0);
+                let hurt = m.hp.unwrap_or(1400.0) < 0.5 * m.max_hp.unwrap_or(1400.0);
+                let risky = m.has("laser") || self.prm.nlr > 1.5;
+                if risky && !(attacking || tgt_d < self.prm.nlr_d || hurt) {
                     target_mech = None;
                     self.target_id = None;
                 }
@@ -2209,6 +2359,28 @@ impl Brain {
         self.mode = mode;
         if self.duel_on {
             self.duel_track(obs, mode, gst_before);
+            for e in &obs.events {
+                match e.kind.as_str() {
+                    "damaged" => {
+                        let by = e.by.unwrap_or(-1);
+                        let dd = self.tracks.get(&by).filter(|tr| obs.t - tr.seen_t < 1.0).map(|tr| hdist(tr.pos, pos)).unwrap_or(-1.0);
+                        self.dth_log.push_back((obs.t, by, e.weapon.clone().unwrap_or_default(), e.amount.unwrap_or(0.0), e.rear.unwrap_or(false), dd));
+                    }
+                    "kill" => self.kill_ts.push(obs.t),
+                    _ => {}
+                }
+            }
+            while self.dth_log.front().map(|d| obs.t - d.0 > 30.0).unwrap_or(false) {
+                self.dth_log.pop_front();
+            }
+            self.dth_hist.push_back((obs.t, mode, self.retreating, kiting, me.hp, enemies.len(), n_shooting));
+            while self.dth_hist.front().map(|d| obs.t - d.0 > 20.0).unwrap_or(false) {
+                self.dth_hist.pop_front();
+            }
+            self.dth_myw = me.weapons.iter().flatten().map(|w| w.kind.clone()).collect::<Vec<_>>().join("+");
+            self.dth_cubes = me.cubes;
+            let _ = self.dth_kiting;
+            let _ = self.dth_nshoot;
         }
         let _ = my_scale;
         if self.debug && self.ticks % self.debug_every == 0 {
