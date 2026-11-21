@@ -154,7 +154,7 @@ impl Default for Params {
         Params {
             p_laser: 4.0,
             p_light: 3.0,
-            p_gun: 2.0,
+            p_gun: 3.5,
             p_mortar: 1.5,
             light_lo: 10.0,
             light_hi: 32.0,
