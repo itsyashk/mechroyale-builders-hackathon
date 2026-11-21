@@ -74,6 +74,37 @@ struct Duel {
     cover_ticks: u32,
 }
 
+/// Weapon-usage statistics (MECHBOT_WSTAT instrumentation).
+#[derive(Clone, Debug, Default)]
+struct WStat {
+    on: bool,
+    laser_t: f32,
+    first_w2_t: f32,
+    /// Damage dealt to mechs by weapon: gun, laser, lightning, mortar.
+    dmg_m: [f32; 4],
+    /// Damage dealt to npcs/crates by weapon.
+    dmg_o: [f32; 4],
+    l_hits_m: u32,
+    l_hits_o: u32,
+    /// Laser releases: total, at a mech target, partial, held long, no LOS at release.
+    l_rel: u32,
+    l_rel_m: u32,
+    l_partial: u32,
+    l_held: u32,
+    l_rel_nolos: u32,
+    l_charge_sum: f32,
+    ch_ticks: u32,
+    ch_nolos: u32,
+    ch_notgt: u32,
+    shorted: u32,
+    prev_charge: f32,
+    prev_los: bool,
+    prev_mech: bool,
+    full_ticks: u32,
+    full_sum: u32,
+    takes: Vec<String>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Mode {
     Zone,
@@ -158,6 +189,7 @@ pub struct Brain {
     juke_dir: [f32; 2],
     juke_src: i64,
     akl_prev: [f32; 2],
+    ws: WStat,
     // config numbers
     pickup_radius: f32,
     cube_radius: f32,
@@ -244,6 +276,20 @@ pub struct Params {
     pub mlz: f32,
     pub lj_t0: f32,
     pub lj_len: f32,
+    /// Gun keeps firing (aimed at its own intercept) while the laser charges.
+    pub chg_gun: f32,
+    /// Release the laser once charge >= lrel x full and aligned on target.
+    pub lrel: f32,
+    /// Laser (hitscan) aim lead in seconds of target velocity.
+    pub llead: f32,
+    /// 1 = laser upgrades first while holding a laser.
+    pub lupg: f32,
+    /// 1 = may start charging without line of sight while in cover.
+    pub lcov: f32,
+    /// >0: release a full charge held this long (s) toward the target instead of letting it auto-fire.
+    pub lhold: f32,
+    /// Mortar slow/clustered targets even with a working gun in LOS.
+    pub mclus: f32,
 }
 
 impl Default for Params {
@@ -304,6 +350,13 @@ impl Default for Params {
             mlz: 1.0,
             lj_t0: 0.15,
             lj_len: 0.6,
+            chg_gun: 0.0,
+            lrel: 1.0,
+            llead: 0.1,
+            lupg: 0.0,
+            lcov: 1.0,
+            lhold: 0.0,
+            mclus: 0.0,
         }
     }
 }
@@ -372,6 +425,13 @@ impl Params {
                     "mlz" => p.mlz = x,
                     "lj_t0" => p.lj_t0 = x,
                     "lj_len" => p.lj_len = x,
+                    "chg_gun" => p.chg_gun = x,
+                    "lrel" => p.lrel = x,
+                    "llead" => p.llead = x,
+                    "lupg" => p.lupg = x,
+                    "lcov" => p.lcov = x,
+                    "lhold" => p.lhold = x,
+                    "mclus" => p.mclus = x,
                     _ => eprintln!("unknown param {k}"),
                 }
             }
@@ -533,6 +593,7 @@ impl Brain {
             juke_dir: [0.0, 0.0],
             juke_src: -1,
             akl_prev: [0.0, 0.0],
+            ws: WStat { on: std::env::var("MECHBOT_WSTAT").is_ok(), laser_t: -1.0, first_w2_t: -1.0, ..Default::default() },
             duel_on: std::env::var("MECHBOT_DUEL").is_ok(),
             debug: std::env::var("MECHBOT_DEBUG").is_ok(),
             gstat: [0; 7],
@@ -668,6 +729,14 @@ impl Brain {
 
     pub fn log_end(&self, raw: &str) {
         eprintln!("end: {raw} gunstat[mech_ticks,fire,nolos,range,ammo/reload,aim,hold]={:?} sniper[peek,hide,nopair,_]={:?}", self.gstat, self.sn_stat);
+        if self.ws.on {
+            let w = &self.ws;
+            eprintln!(
+                "wstat: {{\"t\":{:.1},\"laser_t\":{:.1},\"w2_t\":{:.1},\"takes\":{:?},\"dmg_m\":[{:.0},{:.0},{:.0},{:.0}],\"dmg_o\":[{:.0},{:.0},{:.0},{:.0}],\"l_hits_m\":{},\"l_hits_o\":{},\"l_rel\":{},\"l_rel_m\":{},\"l_partial\":{},\"l_held\":{},\"l_rel_nolos\":{},\"l_charge_sum\":{:.2},\"ch_ticks\":{},\"ch_nolos\":{},\"ch_notgt\":{},\"shorted\":{},\"full_sum\":{}}}",
+                self.t, w.laser_t, w.first_w2_t, w.takes, w.dmg_m[0], w.dmg_m[1], w.dmg_m[2], w.dmg_m[3], w.dmg_o[0], w.dmg_o[1], w.dmg_o[2], w.dmg_o[3],
+                w.l_hits_m, w.l_hits_o, w.l_rel, w.l_rel_m, w.l_partial, w.l_held, w.l_rel_nolos, w.l_charge_sum, w.ch_ticks, w.ch_nolos, w.ch_notgt, w.shorted, w.full_sum
+            );
+        }
         if self.duel_on {
             for (id, d) in &self.duels {
                 self.duel_close(*id, d, if self.t - d.last < 8.0 { "died" } else { "split" });
@@ -1038,7 +1107,32 @@ impl Brain {
                         self.dmg_log.push((obs.t, b, e.by, e.amount.unwrap_or(0.0)));
                     }
                 }
-                "hit" => self.last_deal_t = obs.t,
+                "hit" => {
+                    self.last_deal_t = obs.t;
+                    if self.ws.on {
+                        let wi = match e.weapon.as_deref() {
+                            Some("gun") => 0,
+                            Some("laser") => 1,
+                            Some("lightning") => 2,
+                            _ => 3,
+                        };
+                        let mech = e.target.map(|t| t < 100).unwrap_or(false);
+                        let a = e.amount.unwrap_or(0.0);
+                        if mech {
+                            self.ws.dmg_m[wi] += a;
+                        } else {
+                            self.ws.dmg_o[wi] += a;
+                        }
+                        if wi == 1 {
+                            if mech {
+                                self.ws.l_hits_m += 1;
+                            } else {
+                                self.ws.l_hits_o += 1;
+                            }
+                        }
+                    }
+                }
+                "effect" if self.ws.on && e.effect.as_deref() == Some("short") => self.ws.shorted += 1,
                 "kill" if self.debug => {
                     let ae = e.target.and_then(|id| self.tracks.get(&id)).map(|t| t.aerr).unwrap_or(-1.0);
                     eprintln!("  KILL t={:.1} target={:?} hp={:.0}/{:.0} vis={} aerr={:.3}", obs.t, e.target, me.hp, me.max_hp, obs.mechs.iter().filter(|m| m.is_mech()).count(), ae);
@@ -1114,8 +1208,18 @@ impl Brain {
             } else {
                 UPGRADE_RANK
             };
+            let lz_held = me.weapons.iter().flatten().any(|w| w.kind == "laser");
             for (i, c) in offer.choices.iter().enumerate() {
-                let r = rank.iter().position(|u| *u == c.id).unwrap_or(rank.len());
+                let mut r = 10 + 10 * rank.iter().position(|u| *u == c.id).unwrap_or(rank.len());
+                if self.prm.lupg > 0.0 && lz_held {
+                    if c.id == "laser_damage" {
+                        r = 0;
+                    } else if c.id == "laser_charge" && self.prm.lupg > 1.5 {
+                        r = 1;
+                    } else if c.id == "laser_charge" {
+                        r = r.min(15);
+                    }
+                }
                 if r < best.0 {
                     best = (r, i);
                 }
@@ -1965,6 +2069,52 @@ impl Brain {
             aim = Some(a);
             fire = f;
         }
+        if self.ws.on {
+            let kinds: Vec<&str> = me.weapons.iter().flatten().map(|w| w.kind.as_str()).collect();
+            let ks = kinds.join("+");
+            if self.ws.takes.last().map(|x| !x.ends_with(&format!(":{ks}"))).unwrap_or(true) {
+                self.ws.takes.push(format!("{:.0}:{ks}", obs.t));
+            }
+            if kinds.contains(&"laser") && self.ws.laser_t < 0.0 {
+                self.ws.laser_t = obs.t;
+            }
+            if kinds.len() >= 2 && self.ws.first_w2_t < 0.0 {
+                self.ws.first_w2_t = obs.t;
+            }
+            let lw = me.weapons.iter().flatten().find(|w| w.kind == "laser");
+            let ch = lw.map(|w| w.charge.unwrap_or(0.0)).unwrap_or(0.0);
+            let full = lw.map(|w| w.stat("charge", 0.75)).unwrap_or(0.75);
+            if self.ws.prev_charge > 0.0 && ch <= 0.0 {
+                self.ws.l_rel += 1;
+                self.ws.l_charge_sum += self.ws.prev_charge;
+                if self.ws.prev_mech {
+                    self.ws.l_rel_m += 1;
+                }
+                if self.ws.prev_charge < full - 0.05 {
+                    self.ws.l_partial += 1;
+                }
+                self.ws.full_sum += self.ws.full_ticks;
+                if self.ws.full_ticks >= 20 {
+                    self.ws.l_held += 1;
+                }
+                if !self.ws.prev_los {
+                    self.ws.l_rel_nolos += 1;
+                }
+            }
+            let los_t = tgt.map(|tg| self.world.los(muzzle, [tg.pos[0], tg.pos[1], tg.pos[2] + 4.5 * tg.scale])).unwrap_or(false);
+            if ch > 0.0 {
+                self.ws.ch_ticks += 1;
+                if tgt.is_none() {
+                    self.ws.ch_notgt += 1;
+                } else if !los_t {
+                    self.ws.ch_nolos += 1;
+                }
+            }
+            if ch >= full - 0.01 { self.ws.full_ticks += 1 } else { self.ws.full_ticks = 0 }
+            self.ws.prev_charge = ch;
+            self.ws.prev_los = los_t;
+            self.ws.prev_mech = tgt.map(|t| matches!(t.kind, TargetKind::Mech)).unwrap_or(false);
+        }
         // Being hurt by someone we cannot see (usually from behind, x1.5): turn to face it.
         if self.prm.turn_unseen > 0.0 && tgt_hp > 300.0 {
             let mut per: Vec<(i64, f32, f32)> = vec![];
@@ -2094,7 +2244,7 @@ impl Brain {
             let (q, _) = intercept(muzzle, center, tg.vel, sp, 3.0, 0.05, grounded);
             aim_at(muzzle, q)
         });
-        let direct = aim_at(muzzle, add(center, scale(tg.vel, 0.1)));
+        let direct = aim_at(muzzle, add(center, scale(tg.vel, self.prm.llead)));
         let mut aim = gun_aim.unwrap_or(direct);
 
         let tol_yaw = (radius * 0.75 / d.max(1.0)).atan() + 0.006;
@@ -2110,19 +2260,33 @@ impl Brain {
             let full = lw.stat("charge", 0.75);
             let range = lw.stat("range", 280.0);
             let charge = lw.charge.unwrap_or(0.0);
+            // While the charge builds, the gun may keep shooting at its own intercept; swing
+            // onto the hitscan line just before the charge is full.
+            let gun_live = gun.map(|g| w(g).ammo.unwrap_or(1.0) > 0.0 && w(g).reload.unwrap_or(0.0) <= 0.0).unwrap_or(false) && los && allow;
+            let swing = |ga: [f32; 2]| wrap(ga[0] - direct[0]).abs().max((ga[1] - direct[1]).abs()) / 3.0 + 0.1;
             if charge > 0.0 {
                 aim = direct;
-                let ready = charge >= full - 0.03;
+                if self.prm.chg_gun > 0.0 && gun_live {
+                    if let Some(ga) = gun_aim {
+                        if charge < full * self.prm.lrel.min(1.0) - swing(ga) {
+                            aim = ga;
+                        }
+                    }
+                }
+                let ready = charge >= full * self.prm.lrel.min(1.0) - 0.03;
                 if ready && los && aligned(direct) {
                     fire[li] = false; // release
-                } else if charge > full + 1.6 {
-                    fire[li] = false; // about to auto-fire anyway
                 } else {
                     fire[li] = true;
                 }
-            } else if lw.cooldown <= 0.05 && d < range && (los && allow || hiding || snipe) && !matches!(tg.kind, TargetKind::Crate) {
+            } else if lw.cooldown <= 0.05 && d < range && (los && allow || (hiding || snipe) && self.prm.lcov > 0.0) && !matches!(tg.kind, TargetKind::Crate) {
                 fire[li] = true;
                 aim = direct;
+                if self.prm.chg_gun > 0.0 && gun_live {
+                    if let Some(ga) = gun_aim {
+                        aim = ga;
+                    }
+                }
             }
         }
 
@@ -2132,7 +2296,11 @@ impl Brain {
             let range = gw.stat("range", 230.0);
             let ammo = gw.ammo.unwrap_or(1.0);
             let reloading = gw.reload.unwrap_or(0.0) > 0.0;
-            let ok_aim = if laser.map(|li| fire[li]).unwrap_or(false) { aligned(ga) || aligned(direct) && d < 60.0 } else { aligned(ga) };
+            let ok_aim = if laser.map(|li| fire[li]).unwrap_or(false) {
+                aligned(ga) || aligned(direct) && (d < 60.0 || self.prm.chg_gun > 1.5)
+            } else {
+                aligned(ga)
+            };
             if los && d < range && ammo > 0.0 && !reloading && ok_aim && allow {
                 fire[gi] = true;
             }
@@ -2177,7 +2345,11 @@ impl Brain {
             let gun_busy = gun.map(|g| w(g).reload.unwrap_or(0.0) > 0.0 || w(g).ammo.unwrap_or(1.0) <= 0.0).unwrap_or(true);
             let laser_busy = laser.map(|l| w(l).charge.unwrap_or(0.0) > 0.0).unwrap_or(false);
             let zapper = self.prm.mlz > 0.0 && dh < 70.0 && self.tracks.get(&tg.id).map(|t| t.weapons.iter().any(|w| w == "lightning")).unwrap_or(false);
-            if mw.cooldown <= 0.05 && dh > 22.0 && dh < 225.0 && (!los || gun_busy || zapper) && !laser_busy && allow {
+            let clus = self.prm.mclus > 0.0
+                && matches!(tg.kind, TargetKind::Mech)
+                && (hdist(tg.vel, [0.0, 0.0, 0.0]) < 2.5
+                    || self.tracks.iter().any(|(id, t)| *id != tg.id && obs.t - t.seen_t < 0.5 && hdist(t.pos, tg.pos) < 12.0));
+            if mw.cooldown <= 0.05 && dh > 22.0 && dh < 225.0 && (!los || gun_busy || zapper || clus) && !laser_busy && allow {
                 let sp = mw.stat("speed", 72.0);
                 let g = mw.stat("gravity", self.gravity);
                 let tube = [pos[0], pos[1], pos[2] + statf(me, "height", 9.0) + 0.5];
