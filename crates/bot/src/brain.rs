@@ -323,7 +323,7 @@ impl Default for Params {
             gun_hi: 100.0,
             vs_light_lo: 56.0,
             retreat_ratio: 100.0,
-            retreat_hp: 0.6,
+            retreat_hp: 0.0,
             farm_hp: 0.6,
             farm_range: 70.0,
             engage_all: 1.0,
