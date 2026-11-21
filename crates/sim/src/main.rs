@@ -154,6 +154,8 @@ struct SlotRes {
     late: u32,
     missing: u32,
     bad: u32,
+    victims: String,
+    taken_by: String,
 }
 
 struct MatchRes {
@@ -416,7 +418,20 @@ fn run_match(st: &Arc<Statics>, cfg: &Arc<Cfg>, o: &Opts, idx: usize) -> Result<
             None => (vec![], 0, 0, 0, tier_name(layout[s].1).to_string()),
         };
         let killer = m.killer.map(|k| format!("{}{}#{k}", tier_name(layout[k].1), if squad.hunter[k] { "(hunter)" } else { "" })).unwrap_or_else(|| if m.alive { "-".into() } else { m.cause.to_string() });
+        let mut vl: Vec<(f32, String)> = (0..n)
+            .filter(|&j| !g.mechs[j].alive && g.mechs[j].killer == Some(s))
+            .map(|j| (g.mechs[j].death_t, format!("[{:.1},\"{}\",\"{}\"]", g.mechs[j].death_t, tier_name(layout[j].1), g.mechs[j].cause)))
+            .collect();
+        vl.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        let mut tk: std::collections::BTreeMap<String, f32> = Default::default();
+        for (a, w, amt) in &g.mechs[s].taken_log {
+            *tk.entry(format!("{}/{}", tier_name(layout[*a].1), w)).or_default() += amt;
+        }
+        let taken_by = format!("{{{}}}", tk.iter().map(|(k, v)| format!("\"{k}\":{v:.0}")).collect::<Vec<_>>().join(","));
+        let victims = format!("[{}]", vl.into_iter().map(|v| v.1).collect::<Vec<_>>().join(","));
         slots.push(SlotRes {
+            victims,
+            taken_by,
             slot: s,
             cmd: layout[s].0,
             tier: layout[s].1,
@@ -594,7 +609,7 @@ fn main() {
                             if let Some(f) = &out_file {
                                 let mut tm = s.times.clone();
                                 let line = format!(
-                                    r#"{{"match":{},"seed":{},"slot":{},"cmd":{},"name":{},"place":{},"score":{},"kills":{},"survival":{:.2},"dealt":{:.1},"taken":{:.1},"cubes":{},"cause":"{}","killer":"{}","p50_ms":{:.2},"p99_ms":{:.2},"max_ms":{:.2},"late":{},"missing":{},"bad":{},"wall_s":{:.2},"sim_s":{:.2}}}"#,
+                                    r#"{{"match":{},"seed":{},"slot":{},"cmd":{},"name":{},"place":{},"score":{},"kills":{},"survival":{:.2},"dealt":{:.1},"taken":{:.1},"cubes":{},"cause":"{}","killer":"{}","p50_ms":{:.2},"p99_ms":{:.2},"max_ms":{:.2},"late":{},"missing":{},"bad":{},"wall_s":{:.2},"sim_s":{:.2},"victims":{},"taken_by":{}}}"#,
                                     r.idx,
                                     r.seed,
                                     s.slot,
@@ -616,7 +631,9 @@ fn main() {
                                     s.missing,
                                     s.bad,
                                     r.wall,
-                                    r.sim_t
+                                    r.sim_t,
+                                    s.victims,
+                                    s.taken_by
                                 );
                                 let _ = writeln!(f.lock().unwrap(), "{line}");
                             }

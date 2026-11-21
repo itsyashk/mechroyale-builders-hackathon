@@ -198,6 +198,7 @@ pub struct Mech {
     pub kills: u32,
     pub dmg_dealt: f32,
     pub dmg_taken: f32,
+    pub taken_log: Vec<(usize, &'static str, f32)>,
     pub death_t: f32,
     pub place: u32,
     pub cause: &'static str,
@@ -461,6 +462,7 @@ impl Game {
                 kills: 0,
                 dmg_dealt: 0.0,
                 dmg_taken: 0.0,
+                taken_log: Vec::new(),
                 death_t: -1.0,
                 place: 0,
                 cause: "alive",
@@ -948,6 +950,11 @@ impl Game {
                 let m = &mut self.mechs[i];
                 m.hp -= amt;
                 m.dmg_taken += amt;
+                if m.external {
+                    if let Src::Mech(a) = src {
+                        m.taken_log.push((a, weapon, amt));
+                    }
+                }
                 m.last_combat = t;
                 m.last_hit_by = Some(src);
                 m.last_hit_weapon = weapon;

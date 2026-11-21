@@ -38,6 +38,8 @@ struct Track {
     cubes: i32,
     seen_t: f32,
     first_t: f32,
+    /// EMA of the angle between its aim and a perfect gun lead on us (rad): skill estimate.
+    aerr: f32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -49,6 +51,7 @@ enum Mode {
     Farm,
     Drop,
     Roam,
+    Hold,
 }
 
 #[derive(Clone, Copy)]
@@ -96,12 +99,15 @@ pub struct Brain {
     ticks: u64,
     debug: bool,
     debug_every: u64,
+    gstat: [u32; 7],
     dodge_goal: Option<[f32; 2]>,
     dodge_check_t: f32,
     dodges: u32,
     last_ttk: f32,
     prm: Params,
     tac_t: f32,
+    hold_spot: Option<([f32; 2], f32)>,
+    hold_eval_t: f32,
     tac_goal: Option<[f32; 2]>,
     escape_until: f32,
     allow_escape: bool,
@@ -153,6 +159,22 @@ pub struct Params {
     pub magnet: f32,
     pub tactic: f32,
     pub heal: f32,
+    pub kite: f32,
+    pub turn_unseen: f32,
+    pub hp_w: f32,
+    pub multi_far: f32,
+    pub weak_first: f32,
+    pub treload: f32,
+    pub hold: f32,
+    pub hold_t: f32,
+    pub hold_r: f32,
+    pub leash: f32,
+    pub kite_light: f32,
+    pub st_lo: f32,
+    pub st_hi: f32,
+    pub radw: f32,
+    pub fboost: f32,
+    pub finish: f32,
 }
 
 impl Default for Params {
@@ -162,12 +184,12 @@ impl Default for Params {
             p_light: 3.0,
             p_gun: 3.5,
             p_mortar: 1.5,
-            light_lo: 10.0,
-            light_hi: 32.0,
-            laser_lo: 45.0,
-            laser_hi: 140.0,
-            gun_lo: 18.0,
-            gun_hi: 55.0,
+            light_lo: 25.0,
+            light_hi: 38.0,
+            laser_lo: 80.0,
+            laser_hi: 170.0,
+            gun_lo: 50.0,
+            gun_hi: 100.0,
             vs_light_lo: 56.0,
             retreat_ratio: 0.85,
             retreat_hp: 0.6,
@@ -179,6 +201,22 @@ impl Default for Params {
             magnet: 50.0,
             tactic: 0.0,
             heal: 0.0,
+            kite: 0.0,
+            turn_unseen: 0.0,
+            hp_w: 0.04,
+            multi_far: 0.0,
+            weak_first: 0.0,
+            treload: 0.0,
+            hold: 0.0,
+            hold_t: 40.0,
+            hold_r: 70.0,
+            leash: 10.0,
+            kite_light: 55.0,
+            st_lo: 0.45,
+            st_hi: 1.3,
+            radw: 1.2,
+            fboost: 0.0,
+            finish: 2.0,
         }
     }
 }
@@ -213,6 +251,22 @@ impl Params {
                     "magnet" => p.magnet = x,
                     "tactic" => p.tactic = x,
                     "heal" => p.heal = x,
+                    "kite" => p.kite = x,
+                    "turn_unseen" => p.turn_unseen = x,
+                    "hp_w" => p.hp_w = x,
+                    "multi_far" => p.multi_far = x,
+                    "weak_first" => p.weak_first = x,
+                    "treload" => p.treload = x,
+                    "hold" => p.hold = x,
+                    "hold_t" => p.hold_t = x,
+                    "hold_r" => p.hold_r = x,
+                    "leash" => p.leash = x,
+                    "kite_light" => p.kite_light = x,
+                    "st_lo" => p.st_lo = x,
+                    "st_hi" => p.st_hi = x,
+                    "radw" => p.radw = x,
+                    "fboost" => p.fboost = x,
+                    "finish" => p.finish = x,
                     _ => eprintln!("unknown param {k}"),
                 }
             }
@@ -247,6 +301,33 @@ const UPGRADE_RANK_DPS: &[&str] = &[
     "servos",
     "capacitor",
     "reactor",
+    "jets",
+    "sensors",
+    "lightning_chain",
+    "mortar_reload",
+    "mortar_velocity",
+    "mortar_splash",
+    "laser_pierce",
+];
+
+/// Sustained gun DPS is reload-bound (12 rounds in 2.9 s, then 2.4 s reload), so the drum
+/// magazine is worth ~+31% gun DPS: rank it with plating.
+const UPGRADE_RANK_MAG: &[&str] = &[
+    "plating",
+    "gun_mag",
+    "armor",
+    "laser_damage",
+    "gun_damage",
+    "nanites",
+    "laser_charge",
+    "gun_rate",
+    "gyros",
+    "lightning_efficiency",
+    "lightning_range",
+    "servos",
+    "capacitor",
+    "reactor",
+    "gun_velocity",
     "jets",
     "sensors",
     "lightning_chain",
@@ -328,12 +409,15 @@ impl Brain {
             last_ttk: 0.0,
             prm: Params::from_env(),
             tac_t: -1.0,
+            hold_spot: None,
+            hold_eval_t: -100.0,
             tac_goal: None,
             escape_until: -1.0,
             allow_escape: true,
             escape_goal: [0.0, 0.0],
             last_ttd: 0.0,
             debug: std::env::var("MECHBOT_DEBUG").is_ok(),
+            gstat: [0; 7],
             debug_every: std::env::var("MECHBOT_DEBUG").ok().and_then(|v| v.parse().ok()).unwrap_or(10).max(1),
         })
     }
@@ -345,7 +429,7 @@ impl Brain {
     }
 
     pub fn log_end(&self, raw: &str) {
-        eprintln!("end: {raw}");
+        eprintln!("end: {raw} gunstat[mech_ticks,fire,nolos,range,ammo/reload,aim,hold]={:?}", self.gstat);
     }
 
     // ------------------------------------------------------------------ helpers --------
@@ -430,6 +514,64 @@ impl Brain {
     }
 
     /// Search for a walkable spot near `pos` hidden from every threat eye.
+    /// How enclosed a spot is: (rays blocked within 18 m out of 16, open lanes).
+    fn nook_score(&self, c: [f32; 2]) -> f32 {
+        let g = self.world.ground(c[0], c[1]);
+        let eye = [c[0], c[1], g + 6.5];
+        let mut blocked = 0;
+        for k in 0..16 {
+            let a = k as f32 * PI / 8.0;
+            let d = [a.cos(), a.sin(), 0.0];
+            if self.world.raycast(eye, d, 18.0) < 17.5 {
+                blocked += 1;
+            }
+        }
+        // Want walls on most sides but a few lanes to shoot down.
+        let b = blocked as f32;
+        if blocked >= 15 {
+            return 9.0;
+        }
+        b.min(12.0) - if blocked > 12 { (b - 12.0) * 1.5 } else { 0.0 }
+    }
+
+    /// Picks a defensible spot near `pos` inside the circle (re-uses the current one if still good).
+    fn pick_hold_spot(&mut self, pos: [f32; 2], circle: ([f32; 2], f32), t: f32) {
+        let (gc, gr) = circle;
+        let inside = |c: [f32; 2]| dist2(c, gc) < gr * 0.8;
+        if let Some((sp, sc)) = self.hold_spot {
+            if inside(sp) && t - self.hold_eval_t < 12.0 {
+                return;
+            }
+            if !inside(sp) {
+                self.hold_spot = None;
+            } else {
+                let _ = sc;
+            }
+        }
+        self.hold_eval_t = t;
+        let mut best: Option<(f32, [f32; 2], f32)> = self.hold_spot.map(|(sp, _)| {
+            let ns = self.nook_score(sp);
+            (ns - dist2(sp, pos) / 40.0, sp, ns)
+        });
+        let r = self.prm.hold_r;
+        // Anchor the search on the part of the circle near us.
+        let anchor = if inside(pos) { pos } else { [gc[0] + (pos[0] - gc[0]) * 0.5, gc[1] + (pos[1] - gc[1]) * 0.5] };
+        for _ in 0..140 {
+            let a = self.rng.f() * 2.0 * PI;
+            let rr = r * self.rng.f().sqrt();
+            let c = [anchor[0] + rr * a.cos(), anchor[1] + rr * a.sin()];
+            if !inside(c) || !self.nav.walkable_at(c[0], c[1]) || self.nav.clearance_at(c[0], c[1]) < 3.2 {
+                continue;
+            }
+            let ns = self.nook_score(c);
+            let sc = ns - dist2(c, pos) / 40.0;
+            if best.map(|b| sc > b.0).unwrap_or(true) {
+                best = Some((sc, c, ns));
+            }
+        }
+        self.hold_spot = best.map(|b| (b.1, b.2));
+    }
+
     fn find_cover(&mut self, pos: V3, threats: &[V3], circle: ([f32; 2], f32), away_from: Option<[f32; 2]>, max_r: f32) -> Option<[f32; 2]> {
         let mut best: Option<(f32, [f32; 2])> = None;
         let rings = [5.0f32, 9.0, 14.0, 20.0, 28.0, 38.0];
@@ -587,6 +729,10 @@ impl Brain {
                     }
                 }
                 "hit" => self.last_deal_t = obs.t,
+                "kill" if self.debug => {
+                    let ae = e.target.and_then(|id| self.tracks.get(&id)).map(|t| t.aerr).unwrap_or(-1.0);
+                    eprintln!("  KILL t={:.1} target={:?} hp={:.0}/{:.0} vis={} aerr={:.3}", obs.t, e.target, me.hp, me.max_hp, obs.mechs.iter().filter(|m| m.is_mech()).count(), ae);
+                }
                 "take_failed" => {
                     if let Some(id) = e.id.as_ref().and_then(|v| v.as_i64()) {
                         self.bad_pickups.insert(id, obs.t);
@@ -598,6 +744,19 @@ impl Brain {
         self.dmg_log.retain(|d| obs.t - d.0 < 6.0);
         for m in obs.mechs.iter().filter(|m| m.is_mech() && m.id != me.id) {
             let first_t = self.tracks.get(&m.id).map(|t| t.first_t).unwrap_or(obs.t);
+            let mut aerr = self.tracks.get(&m.id).map(|t| t.aerr).unwrap_or(0.05);
+            {
+                let d = hdist(m.pos, pos);
+                let their_muz = [m.pos[0], m.pos[1], m.pos[2] + 7.0];
+                let my_c = [pos[0], pos[1], pos[2] + 4.5 * my_scale];
+                let (q, _) = intercept(their_muz, my_c, me.vel, 252.0, 3.0, 0.0, me.grounded);
+                let ideal = aim_at(their_muz, q);
+                let direct = aim_at(their_muz, my_c);
+                let e = wrap(m.aim[0] - ideal[0]).abs().min(wrap(m.aim[0] - direct[0]).abs());
+                if d > 15.0 && d < 200.0 && e < 0.35 {
+                    aerr = aerr * 0.93 + e.min(0.2) * 0.07;
+                }
+            }
             self.tracks.insert(
                 m.id,
                 Track {
@@ -611,6 +770,7 @@ impl Brain {
                     cubes: m.cubes.unwrap_or(0),
                     seen_t: obs.t,
                     first_t,
+                    aerr,
                 },
             );
         }
@@ -635,7 +795,13 @@ impl Brain {
         // ---- upgrades
         if let Some(offer) = &obs.offer {
             let mut best = (usize::MAX, 0usize);
-            let rank = if self.prm.upg > 0.5 { UPGRADE_RANK_DPS } else { UPGRADE_RANK };
+            let rank = if self.prm.upg > 1.5 {
+                UPGRADE_RANK_MAG
+            } else if self.prm.upg > 0.5 {
+                UPGRADE_RANK_DPS
+            } else {
+                UPGRADE_RANK
+            };
             for (i, c) in offer.choices.iter().enumerate() {
                 let r = rank.iter().position(|u| *u == c.id).unwrap_or(rank.len());
                 if r < best.0 {
@@ -660,7 +826,7 @@ impl Brain {
             let d = len3(sub(m.pos, pos));
             let shootable = self.world.los(muzzle, [m.pos[0], m.pos[1], m.pos[2] + 4.5 * scale]);
             let hp = m.hp.unwrap_or(1400.0);
-            let mut s = d + hp * 0.04;
+            let mut s = d + hp * self.prm.hp_w;
             if shootable {
                 s -= 60.0;
             }
@@ -671,6 +837,14 @@ impl Brain {
             s -= dmg_by(m.id, &self.dmg_log) * 0.25;
             if Some(m.id) == self.target_id {
                 s -= 30.0;
+            }
+            if self.prm.finish > 0.0 {
+                let mh = m.max_hp.unwrap_or(1400.0).max(1.0);
+                s -= self.prm.finish * (1.0 - hp / mh).max(0.0) * 100.0;
+            }
+            if self.prm.weak_first > 0.0 {
+                let ae = self.tracks.get(&m.id).map(|t| t.aerr).unwrap_or(0.05);
+                s += self.prm.weak_first * (0.04 - ae.min(0.15)) * 800.0;
             }
             if best_t.map(|b| s < b.0).unwrap_or(true) {
                 best_t = Some((s, m, shootable));
@@ -921,6 +1095,27 @@ impl Brain {
             }
         }
 
+        // Hold: once hunters are out, stop wandering; wait in a nook and let them come.
+        let holding = self.prm.hold > 0.0 && obs.t > self.prm.hold_t;
+        if holding {
+            self.pick_hold_spot(p2, (gc, gr), obs.t);
+        }
+        let hold_spot = if holding { self.hold_spot.map(|h| h.0) } else { None };
+        if let Some(sp) = hold_spot {
+            if matches!(mode, Mode::Roam | Mode::Farm | Mode::Loot | Mode::Drop) {
+                let near_goal = goal.map(|g| dist2(g, p2) < 18.0 && dist2(g, sp) < 30.0).unwrap_or(false);
+                let need_weapon = slot_kind(0).is_empty() || slot_kind(1).is_empty();
+                let keep = mode == Mode::Loot && (near_goal || need_weapon);
+                if !keep {
+                    if mode == Mode::Farm {
+                        aux_target = None;
+                    }
+                    mode = Mode::Hold;
+                    goal = Some(sp);
+                }
+            }
+        }
+
         // ---- movement per mode
         let tgt: Option<Target> = target_mech
             .as_ref()
@@ -929,10 +1124,15 @@ impl Brain {
 
         if obs.t > self.strafe_switch_t {
             self.strafe_sign = if self.rng.f() < 0.5 { -1.0 } else { 1.0 };
-            self.strafe_switch_t = obs.t + self.rng.range(0.45, 1.3);
+            self.strafe_switch_t = obs.t + self.rng.range(self.prm.st_lo, self.prm.st_hi);
         }
 
         match mode {
+            Mode::Hold => {
+                if let Some(g) = goal {
+                    mv = if dist2(g, p2) > 2.0 { self.goto(p2, g) } else { [0.0, 0.0] };
+                }
+            }
             Mode::Zone | Mode::Loot | Mode::Drop => {
                 if let Some(g) = goal {
                     mv = self.goto(p2, g);
@@ -982,7 +1182,30 @@ impl Brain {
                 } else {
                     (self.prm.gun_lo, self.prm.gun_hi)
                 };
-                if !shootable {
+                let (lo, hi) = if self.prm.kite_light > 0.0 && m.has("lightning") && !(have_light && tgt_hp < 400.0) {
+                    (lo.max(self.prm.kite_light), hi.max(self.prm.kite_light + 40.0))
+                } else {
+                    (lo, hi)
+                };
+                // Other known enemies near us (visible now or seen in the last 3 s).
+                let others: Vec<[f32; 2]> = self
+                    .tracks
+                    .iter()
+                    .filter(|(id, t)| **id != m.id && obs.t - t.seen_t < 3.0 && hdist(t.pos, pos) < 130.0)
+                    .map(|(_, t)| xy(t.pos))
+                    .collect();
+                let (lo, hi) = if self.prm.multi_far > 0.0 && !others.is_empty() {
+                    (lo.max(self.prm.multi_far), hi.max(self.prm.multi_far + 40.0))
+                } else {
+                    (lo, hi)
+                };
+                let lsh = self.prm.leash;
+                let hold_here = hold_spot.filter(|sp| dist2(*sp, p2) < lsh + 15.0);
+                if !shootable && hold_here.is_some() && d > 40.0 {
+                    // Ambush: it has to come round the corner to us.
+                    let sp = hold_here.unwrap();
+                    mv = if dist2(sp, p2) > 2.0 { self.goto(p2, sp) } else { [0.0, 0.0] };
+                } else if !shootable {
                     // Go find a line on it (or wait at a corner when it is a sniper).
                     mv = self.goto(p2, xy(m.pos));
                     want_boost = d > 60.0;
@@ -997,12 +1220,26 @@ impl Brain {
                         0.0
                     };
                     let to = [b.cos(), b.sin()];
-                    let mut cand = unit2([perp[0] + to[0] * radial * 1.2, perp[1] + to[1] * radial * 1.2]);
+                    let rw = self.prm.radw;
+                    let mut cand = unit2([perp[0] + to[0] * radial * rw, perp[1] + to[1] * radial * rw]);
+                    if self.prm.kite > 0.0 && !others.is_empty() {
+                        let n = others.len() as f32;
+                        let c = [others.iter().map(|o| o[0]).sum::<f32>() / n, others.iter().map(|o| o[1]).sum::<f32>() / n];
+                        let away = unit2([p2[0] - c[0], p2[1] - c[1]]);
+                        cand = unit2([cand[0] + away[0] * self.prm.kite, cand[1] + away[1] * self.prm.kite]);
+                    }
+                    if let Some(sp) = hold_here {
+                        let nxt = [p2[0] + cand[0] * 4.0, p2[1] + cand[1] * 4.0];
+                        if dist2(nxt, sp) > lsh && dist2(p2, sp) > lsh * 0.5 {
+                            let back = unit2([sp[0] - p2[0], sp[1] - p2[1]]);
+                            cand = unit2([cand[0] + back[0] * 1.5, cand[1] + back[1] * 1.5]);
+                        }
+                    }
                     let ok = |c: [f32; 2], nav: &Nav| nav.walkable_at(p2[0] + c[0] * 5.0, p2[1] + c[1] * 5.0);
                     if !ok(cand, &self.nav) {
                         self.strafe_sign = -self.strafe_sign;
                         let perp = [-perp[0], -perp[1]];
-                        cand = unit2([perp[0] + to[0] * radial * 1.2, perp[1] + to[1] * radial * 1.2]);
+                        cand = unit2([perp[0] + to[0] * radial * rw, perp[1] + to[1] * radial * rw]);
                         if !ok(cand, &self.nav) {
                             cand = if radial != 0.0 { [to[0] * radial, to[1] * radial] } else { [0.0, 0.0] };
                             if !ok(cand, &self.nav) {
@@ -1126,7 +1363,7 @@ impl Brain {
         }
 
         // Laser dodge: an enemy charging at us with a clear line -> duck into nearby cover.
-        if matches!(mode, Mode::Fight | Mode::Farm | Mode::Roam | Mode::Loot) {
+        if matches!(mode, Mode::Fight | Mode::Farm | Mode::Roam | Mode::Loot | Mode::Hold) {
             let me_c = [pos[0], pos[1], pos[2] + 4.5 * my_scale];
             let charger = enemies
                 .iter()
@@ -1198,7 +1435,7 @@ impl Brain {
 
         // ---- boost with energy hysteresis (keep a reserve for lightning)
         let reserve = if have_light { 45.0 } else { 12.0 };
-        if have_light && mode == Mode::Fight && tgt_d < 50.0 {
+        if have_light && mode == Mode::Fight && tgt_d < 50.0 && self.prm.fboost < 0.5 {
             want_boost = false;
         }
         if self.boosting {
@@ -1224,6 +1461,29 @@ impl Brain {
             let (a, f) = self.weapons_on(obs, tg, muzzle, mode == Mode::Cover);
             aim = Some(a);
             fire = f;
+        }
+        // Being hurt by someone we cannot see (usually from behind, x1.5): turn to face it.
+        if self.prm.turn_unseen > 0.0 && tgt_hp > 300.0 {
+            let mut per: Vec<(i64, f32, f32)> = vec![];
+            for d in self.dmg_log.iter().filter(|d| obs.t - d.0 < 1.2) {
+                if let Some(b) = d.2 {
+                    if b >= 100 || enemies.iter().any(|m| m.id == b) {
+                        continue;
+                    }
+                    match per.iter_mut().find(|p| p.0 == b) {
+                        Some(p) => {
+                            p.1 += d.3;
+                            p.2 = d.1;
+                        }
+                        None => per.push((b, d.3, d.1)),
+                    }
+                }
+            }
+            if let Some(w) = per.iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()) {
+                if w.1 >= self.prm.turn_unseen {
+                    aim = Some([w.2, 0.0]);
+                }
+            }
         }
         if aim.is_none() {
             // Look toward recent damage from unseen attackers, then sounds, else sweep.
@@ -1253,6 +1513,19 @@ impl Brain {
                     if w.kind == "gun" && w.reload.unwrap_or(0.0) <= 0.0 && w.ammo.unwrap_or(12.0) < w.stat("mag", 12.0) * 0.5 {
                         let _ = i;
                         act.reload = true;
+                    }
+                }
+            }
+        }
+        // Tactical reload: the target has no line on us, so top up the magazine now.
+        if self.prm.treload > 0.0 {
+            if let Some(tg) = &tgt {
+                let c = [tg.pos[0], tg.pos[1], tg.pos[2] + 4.5 * tg.scale];
+                if !self.world.los(muzzle, c) {
+                    for w in me.weapons.iter().flatten() {
+                        if w.kind == "gun" && w.reload.unwrap_or(0.0) <= 0.0 && w.ammo.unwrap_or(12.0) < w.stat("mag", 12.0) * self.prm.treload {
+                            act.reload = true;
+                        }
                     }
                 }
             }
@@ -1356,6 +1629,23 @@ impl Brain {
             let ok_aim = if laser.map(|li| fire[li]).unwrap_or(false) { aligned(ga) || aligned(direct) && d < 60.0 } else { aligned(ga) };
             if los && d < range && ammo > 0.0 && !reloading && ok_aim && allow {
                 fire[gi] = true;
+            }
+            if matches!(tg.kind, TargetKind::Mech) {
+                let k = if fire[gi] {
+                    1
+                } else if !los {
+                    2
+                } else if d >= range {
+                    3
+                } else if ammo <= 0.0 || reloading {
+                    4
+                } else if !ok_aim {
+                    5
+                } else {
+                    6
+                };
+                self.gstat[0] += 1;
+                self.gstat[k] += 1;
             }
         }
 
