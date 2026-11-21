@@ -305,6 +305,9 @@ pub struct Params {
     /// Laser quick release: 1 = fire lethal partial charges, release full charges on loose aim or after lq_hold s.
     pub lq: f32,
     pub lq_hold: f32,
+    /// Critical-HP recovery: retreat below crit_lo, stay until crit_hi (unless cornered or a sub-1.5 s kill).
+    pub crit_lo: f32,
+    pub crit_hi: f32,
     /// Remember out-of-view enemies for this many s (cover choice, threat estimate).
     pub memt: f32,
     pub nlr: f32,
@@ -380,6 +383,8 @@ impl Default for Params {
             lcook: 0.0,
             lq: 1.0,
             lq_hold: 0.4,
+            crit_lo: 0.25,
+            crit_hi: 0.6,
             memt: 0.0,
             nlr: 2.0,
             nlr_t: 90.0,
@@ -462,6 +467,8 @@ impl Params {
                     "lcook" => p.lcook = x,
                     "lq" => p.lq = x,
                     "lq_hold" => p.lq_hold = x,
+                    "crit_lo" => p.crit_lo = x,
+                    "crit_hi" => p.crit_hi = x,
                     "memt" => p.memt = x,
                     "nlr" => p.nlr = x,
                     "nlr_t" => p.nlr_t = x,
@@ -1489,7 +1496,12 @@ impl Brain {
         if self.retreating {
             let safe = hp_frac > 0.8 || enemies.is_empty() && obs.t - self.last_dmg_t > 10.0;
             let cornered = tgt_d < 30.0 && ttk < ttd * 0.8 || self.prm.corner_d > 0.0 && tgt_d < self.prm.corner_d && n_shooting <= 1;
-            let winning = ttk < ttd * 0.9 && n_shooting <= 1 || ttk < 2.0 && ttk < ttd;
+            let mut winning = ttk < ttd * 0.9 && n_shooting <= 1 || ttk < 2.0 && ttk < ttd;
+            let mut safe = safe;
+            if self.prm.crit_lo > 0.0 && hp_frac < self.prm.crit_hi {
+                winning = ttk < 1.5 && ttk < ttd;
+                safe = safe && hp_frac > self.prm.crit_hi;
+            }
             if safe || cornered || winning {
                 self.retreating = false;
             }
@@ -1497,7 +1509,8 @@ impl Brain {
             let losing = ttk > ttd * self.prm.retreat_ratio && ttk > 2.5 && (hp_frac < self.prm.retreat_hp || n_shooting >= 2);
             let low = hp_frac < 0.3 && tgt_hp > me.hp * 0.5;
             let pinned = self.prm.corner_d > 0.0 && tgt_d < self.prm.corner_d && n_shooting <= 1;
-            if (losing || low) && !pinned {
+            let crit = self.prm.crit_lo > 0.0 && hp_frac < self.prm.crit_lo && !(ttk < 1.5 && ttk < ttd);
+            if (losing || low || crit) && !pinned {
                 self.retreating = true;
                 self.cover_goal = None;
             }
