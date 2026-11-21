@@ -381,7 +381,7 @@ impl Default for Params {
             lhold: 0.0,
             mclus: 0.0,
             lcook: 0.0,
-            lq: 1.0,
+            lq: 0.0,
             lq_hold: 0.4,
             crit_lo: 0.25,
             crit_hi: 0.6,
