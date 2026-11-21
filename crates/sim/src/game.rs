@@ -279,7 +279,17 @@ pub enum PK {
     Npc,
 }
 
+/// House-bot hit statistics vs external bots by range bin (<40, 40-80, 80-120, 120-160, 160+ m):
+/// [gun shots x5, gun hits x5, laser shots x5, laser hits x5]. Printed with `SIM_HITSTATS=1`.
+pub static HITSTATS: std::sync::Mutex<[u64; 20]> = std::sync::Mutex::new([0; 20]);
+
+fn hs_bin(d: f32) -> i8 {
+    ((d / 40.0) as i8).min(4)
+}
+
 pub struct Proj {
+    /// HITSTATS range bin (-1 = not a house shot at an external bot).
+    pub hs: i8,
     pub id: i64,
     pub kind: PK,
     pub owner: Src,
@@ -1137,13 +1147,42 @@ impl Game {
         let aim_dir = dir_of(yaw, pitch);
         let origin = self.shot_origin(i, base, aim_dir);
         let dir = dir_of(yaw + self.rng.normal() * sp, pitch + self.rng.normal() * sp);
+        let hs = self.hs_target(i, aim_dir).map(hs_bin).unwrap_or(-1);
+        if hs >= 0 {
+            HITSTATS.lock().unwrap()[hs as usize] += 1;
+        }
         let id = self.next_proj;
         self.next_proj += 1;
         let team = self.mechs[i].team;
         let dmg = ws.damage * self.cube_mult(i);
-        self.projs.push(Proj { id, kind: PK::Gun, owner: Src::Mech(i), team, pos: origin, vel: scale(dir, ws.speed), left: ws.range, dmg, radius: self.cfg.gun_radius, mws: None, scale: 1.0, alive: true });
+        self.projs.push(Proj { hs, id, kind: PK::Gun, owner: Src::Mech(i), team, pos: origin, vel: scale(dir, ws.speed), left: ws.range, dmg, radius: self.cfg.gun_radius, mws: None, scale: 1.0, alive: true });
         self.mechs[i].shots += 1;
         self.sound("gun", base, Some(i));
+    }
+
+    /// Distance to the external (team-less) mech a squad bot's shot from `i` along `dir` is aimed at.
+    fn hs_target(&self, i: usize, dir: V3) -> Option<f32> {
+        if self.mechs[i].team.is_none() {
+            return None;
+        }
+        let o = self.mechs[i].muzzle();
+        let mut best: Option<f32> = None;
+        for m in self.mechs.iter() {
+            if !m.alive || m.team.is_some() {
+                continue;
+            }
+            let c = add(m.pos, [0.0, 0.0, m.ms.height * 0.5]);
+            let v = sub(c, o);
+            let d = len(v);
+            if d < 1.0 || d > 300.0 {
+                continue;
+            }
+            let cosang = (v[0] * dir[0] + v[1] * dir[1] + v[2] * dir[2]) / d;
+            if cosang > 0.985 && best.map(|b| d < b).unwrap_or(true) {
+                best = Some(d);
+            }
+        }
+        best
     }
 
     fn fire_mortar(&mut self, i: usize) {
@@ -1156,7 +1195,7 @@ impl Game {
         self.next_proj += 1;
         let team = m.team;
         let sc = self.cube_mult(i);
-        self.projs.push(Proj { id, kind: PK::Mortar, owner: Src::Mech(i), team, pos: origin, vel: scale(dir, ws.speed), left: ws.ttl, dmg: ws.damage * sc, radius: 0.3, mws: Some(ws), scale: sc, alive: true });
+        self.projs.push(Proj { hs: -1, id, kind: PK::Mortar, owner: Src::Mech(i), team, pos: origin, vel: scale(dir, ws.speed), left: ws.ttl, dmg: ws.damage * sc, radius: 0.3, mws: Some(ws), scale: sc, alive: true });
         self.sound("mortar", base, Some(i));
     }
 
@@ -1170,6 +1209,15 @@ impl Game {
         let dmg = ws.damage * frac * self.cube_mult(i);
         let dw = self.st.w.raycast(origin, dir, ws.range);
         let hits = self.ray_actors(origin, dir, dw, Src::Mech(i), 0.0, true);
+        if let Some(d) = self.hs_target(i, dir) {
+            let b = hs_bin(d) as usize;
+            let hit = hits.first().map(|h| matches!(h.1, Tgt::Mech(j) if self.mechs[j].team.is_none())).unwrap_or(false);
+            let mut hsl = HITSTATS.lock().unwrap();
+            hsl[10 + b] += 1;
+            if hit {
+                hsl[15 + b] += 1;
+            }
+        }
         let n = 1 + ws.pierce.max(0.0) as usize;
         let mut end = add(origin, scale(dir, dw));
         for (k, (t, tg)) in hits.iter().enumerate() {
@@ -1736,7 +1784,7 @@ impl Game {
                         self.next_proj += 1;
                         let ps = self.cfg.npc("projectile_speed");
                         let origin = add(eye, scale(d, body.r + 0.5));
-                        self.projs.push(Proj { id, kind: PK::Npc, owner: Src::Npc(k), team: None, pos: origin, vel: scale(d, ps), left: deaggro * 1.3, dmg: self.cfg.npc("damage"), radius: self.cfg.npc_proj_radius, mws: None, scale: 1.0, alive: true });
+                        self.projs.push(Proj { hs: -1, id, kind: PK::Npc, owner: Src::Npc(k), team: None, pos: origin, vel: scale(d, ps), left: deaggro * 1.3, dmg: self.cfg.npc("damage"), radius: self.cfg.npc_proj_radius, mws: None, scale: 1.0, alive: true });
                         self.sounds.push(Sound { kind: "npc_gun", pos: eye, t: self.t + DT, src: None });
                     }
                 }
@@ -1770,6 +1818,11 @@ impl Game {
                         let _ = t;
                         if let (Src::Mech(a), Tgt::Mech(_), PK::Gun) = (p.owner, tg, p.kind) {
                             self.mechs[a].hits += 1;
+                        }
+                        if let (Tgt::Mech(j), true) = (tg, p.hs >= 0) {
+                            if self.mechs[j].team.is_none() {
+                                HITSTATS.lock().unwrap()[5 + p.hs as usize] += 1;
+                            }
                         }
                         self.hurt(tg, p.dmg, wpn, p.owner, from, None);
                         p.alive = false;

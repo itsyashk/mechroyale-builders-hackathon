@@ -15,13 +15,16 @@ pub const FIRST_HUNT_S_V1: f32 = 45.0;
 /// both the kit example bot and ours), v2 (accurate long-range laser bots hunting from t=0, as in
 /// kit/check/stream.jsonl.gz, which is not a practice match: house bots die there by 25 s; far too
 /// lethal: ~1.3 for us), v3 (v1 with aim error capped past 40 m, retaliation at any range, hard
-/// jinking).
+/// jinking), v4 (calibrated to real practice measurements: hit rate ~90% <40 m, ~61% at 80-120 m,
+/// ~36% at 120-160 m; standoff 55-95 m; a hunter from ~5 s, +1 per fallen mate, all late; shared,
+/// near-exact intel; lasers early; attacking passive bots draws aggro). See `V4` for its knobs.
 pub fn house_v() -> u8 {
     static V: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *V.get_or_init(|| match std::env::var("SIM_HOUSE").as_deref() {
         Ok("v1") | Ok("1") => 1,
         Ok("v2") | Ok("2") => 2,
         Ok("v3") | Ok("3") => 3,
+        Ok("v4") | Ok("4") => 4,
         _ => 1,
     })
 }
@@ -30,6 +33,7 @@ pub fn tiers() -> &'static [Tier; 4] {
     match house_v() {
         1 => &TIERS_V1,
         2 => &TIERS_V2,
+        4 => &TIERS_V4,
         _ => &TIERS_V3,
     }
 }
@@ -57,6 +61,7 @@ pub fn first_hunt_s() -> f32 {
     static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *V.get_or_init(|| match house_v() {
         1 | 3 => FIRST_HUNT_S_V1,
+        4 => v4().first_hunt,
         _ => env_f("SIM_FIRST_HUNT", 0.0),
     })
 }
@@ -69,6 +74,81 @@ pub fn engage_mul() -> f32 {
 pub fn spawn_laser() -> bool {
     house_v() == 2 && env_f("SIM_SPAWN_LASER", 1.0) > 0.5
 }
+
+/// Model 4 knobs (env `SIM_V4_*`, defaults = the calibrated values).
+#[derive(Clone, Debug)]
+pub struct V4 {
+    /// First hunter is sent at this time (s). `SIM_V4_FIRST`
+    pub first_hunt: f32,
+    /// Everyone hunts from this time (s). `SIM_V4_ALL`
+    pub all_hunt: f32,
+    /// Extra hunters per minute after the first minute (0 = only per fallen mate). `SIM_V4_PERMIN`
+    pub per_min: f32,
+    /// Aim error (1 sigma, metres at the target) = sqrt(c0^2 + (k d^2)^2) x tier mult. `SIM_V4_C0`, `SIM_V4_K`
+    pub c0: f32,
+    pub k: f32,
+    /// Laser aim error multiplier (hitscan, aimed while charging). `SIM_V4_LASERMUL`
+    pub laser_mul: f32,
+    /// Standoff band (m). `SIM_V4_LO`, `SIM_V4_HI`
+    pub lo: f32,
+    pub hi: f32,
+    /// A squad bot hurt by us hunts us for this long (s); mates within `alert_r` (m) join. `SIM_V4_AGGRO_S`, `SIM_V4_ALERT_R`
+    pub aggro_s: f32,
+    pub alert_r: f32,
+    /// Squad intel noise radius (m). `SIM_V4_INTEL_NOISE`
+    pub intel_noise: f32,
+    /// House bots of tier >= this spawn with gun + laser (4 = none). `SIM_V4_LASER_TIER`
+    pub laser_tier: usize,
+    /// Non-hunter engage range multiplier. `SIM_V4_ENGAGE_MUL`
+    pub engage_mul: f32,
+}
+
+pub fn v4() -> &'static V4 {
+    static V: std::sync::OnceLock<V4> = std::sync::OnceLock::new();
+    V.get_or_init(|| V4 {
+        first_hunt: env_f("SIM_V4_FIRST", 5.0),
+        all_hunt: env_f("SIM_V4_ALL", 300.0),
+        per_min: env_f("SIM_V4_PERMIN", 0.0),
+        c0: env_f("SIM_V4_C0", 1.4),
+        k: env_f("SIM_V4_K", 2.9e-4),
+        laser_mul: env_f("SIM_V4_LASERMUL", 0.35),
+        lo: env_f("SIM_V4_LO", 55.0),
+        hi: env_f("SIM_V4_HI", 95.0),
+        aggro_s: env_f("SIM_V4_AGGRO_S", 30.0),
+        alert_r: env_f("SIM_V4_ALERT_R", 80.0),
+        intel_noise: env_f("SIM_V4_INTEL_NOISE", 4.0),
+        laser_tier: env_f("SIM_V4_LASER_TIER", 0.0) as usize,
+        engage_mul: env_f("SIM_V4_ENGAGE_MUL", 1.0),
+    })
+}
+
+/// Lasers at spawn for this tier?
+pub fn spawn_laser_tier(tier: usize) -> bool {
+    spawn_laser() || (house_v() == 4 && tier >= v4().laser_tier)
+}
+
+/// Model 4: model 1's squad brain with measured aim (`aim_sigma` is a unitless multiplier of
+/// `V4`'s range-dependent metre error), sharp lead, recorded jinking, short intel refresh.
+pub static TIERS_V4: std::sync::LazyLock<[Tier; 4]> = std::sync::LazyLock::new(|| {
+    let mut t = TIERS_V1.clone();
+    let mult = [1.25, 1.1, 0.9, 0.75];
+    let react = [0.35, 0.28, 0.2, 0.12];
+    for (i, x) in t.iter_mut().enumerate() {
+        x.aim_sigma = mult[i];
+        x.aim_tau = 0.4;
+        x.reaction_s = react[i];
+        x.lead = 1.0;
+        x.track_rate = x.track_rate.max(3.0);
+        x.fire_tol = 1.0;
+        x.retaliate_range = 260.0;
+        x.strafe = x.strafe.max(0.75);
+        x.strafe_period = (0.25, 0.6);
+        x.laser_release = 0.95;
+        x.intel_s = 1.0;
+        x.engage_range *= v4().engage_mul;
+    }
+    t
+});
 
 /// Per-tier behaviour knobs. Tune here.
 #[derive(Clone, Debug)]
@@ -370,12 +450,14 @@ pub struct Squad {
     pub intel: Vec<Option<(V3, f32)>>,
     intel_t: f32,
     pub total: usize,
+    /// v4: squad member hunts until this time after being hurt by us (or a nearby mate was).
+    pub aggro: Vec<f32>,
     rng: Rng,
 }
 
 impl Squad {
     pub fn new(n: usize, total: usize, seed: u64) -> Squad {
-        Squad { hunter: vec![false; n], seen: vec![None; n], vis: vec![vec![false; n]; n], intel: vec![None; n], intel_t: -100.0, total, rng: Rng::new(seed) }
+        Squad { hunter: vec![false; n], seen: vec![None; n], vis: vec![vec![false; n]; n], intel: vec![None; n], intel_t: -100.0, total, aggro: vec![-100.0; n], rng: Rng::new(seed) }
     }
 
     pub fn update(&mut self, g: &Game, brains: &[Option<Brain>]) {
@@ -396,7 +478,7 @@ impl Squad {
         if t - self.intel_t >= 1.0 {
             self.intel_t = t;
             for &j in &targets {
-                let o = self.rng.in_disc(14.0);
+                let o = self.rng.in_disc(if house_v() == 4 { v4().intel_noise } else { 14.0 });
                 let p = g.mechs[j].pos;
                 self.intel[j] = Some(([p[0] + o[0], p[1] + o[1], p[2]], t));
             }
@@ -405,11 +487,35 @@ impl Squad {
         // first, everyone after 5 minutes or once only 4 remain. Weakest tier first.
         let alive = members.len();
         let mut k = if t >= first_hunt_s() { 1 } else { 0 } + self.total.saturating_sub(alive);
-        if t > 60.0 {
-            k += ((t - 60.0) / 60.0) as usize;
-        }
-        if t >= 300.0 || alive <= 4 {
-            k = alive;
+        let v4m = house_v() == 4;
+        if v4m {
+            let c = v4();
+            if t > 60.0 {
+                k += ((t - 60.0) / 60.0 * c.per_min) as usize;
+            }
+            if t >= c.all_hunt || alive <= 4 {
+                k = alive;
+            }
+            // Aggro: a squad bot we hurt (and its mates nearby) hunts us for a while.
+            for &m in &members {
+                let mm = &g.mechs[m];
+                if let Some(Src::Mech(a)) = mm.last_attacker {
+                    if t - mm.last_damaged_t < 0.15 && g.mechs[a].team != Some(SQUAD_TEAM) {
+                        for &o in &members {
+                            if o == m || (c.alert_r > 0.0 && dist(g.mechs[o].pos, mm.pos) < c.alert_r) {
+                                self.aggro[o] = t + c.aggro_s;
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            if t > 60.0 {
+                k += ((t - 60.0) / 60.0) as usize;
+            }
+            if t >= 300.0 || alive <= 4 {
+                k = alive;
+            }
         }
         let mut order = members.clone();
         order.sort_by_key(|&i| (brains[i].as_ref().map(|b| b.tier).unwrap_or(0), i));
@@ -418,6 +524,13 @@ impl Squad {
         }
         for &i in order.iter().take(k) {
             self.hunter[i] = true;
+        }
+        if v4m {
+            for &i in &members {
+                if self.aggro[i] > t {
+                    self.hunter[i] = true;
+                }
+            }
         }
     }
 }
@@ -615,7 +728,9 @@ impl Brain {
                 }
             }
             v.d = dist(v.pos, pos);
-            want_range = if house_v() != 2 {
+            want_range = if house_v() == 4 {
+                0.5 * (v4().lo + v4().hi)
+            } else if house_v() != 2 {
                 let w = if has(WK::Lightning) {
                     24.0
                 } else if has(WK::Laser) {
@@ -657,7 +772,19 @@ impl Brain {
                     self.strafe_sign = if self.rng.chance(0.5) { 1.0 } else { -1.0 };
                     self.strafe_until = t + self.rng.range(tier.strafe_period.0, tier.strafe_period.1);
                 }
-                let mut radial = ((v.d - want_range) / 25.0).clamp(-1.0, 1.0);
+                let mut radial = if house_v() == 4 {
+                    // hold the standoff band: close in past `hi`, back off inside `lo`
+                    let c = v4();
+                    if v.d > c.hi {
+                        ((v.d - c.hi) / 20.0 + 0.3).min(1.0)
+                    } else if v.d < c.lo {
+                        -((c.lo - v.d) / 20.0 + 0.3).min(1.0)
+                    } else {
+                        0.0
+                    }
+                } else {
+                    ((v.d - want_range) / 25.0).clamp(-1.0, 1.0)
+                };
                 let low = m.hp < m.max_hp * tier.retreat_hp && t < 300.0;
                 if low {
                     radial = -1.0;
@@ -865,7 +992,18 @@ impl Brain {
             } else {
                 self.mortar_mode = false;
             }
-            let es = if house_v() == 3 { (40.0 / v.d.max(1.0)).min(1.0) } else { 1.0 };
+            let es = if house_v() == 3 {
+                (40.0 / v.d.max(1.0)).min(1.0)
+            } else if house_v() == 4 {
+                // aim_sigma is a multiplier here; error in metres at the target, as measured
+                let c = v4();
+                let dd = v.d.max(5.0);
+                let em = (c.c0 * c.c0 + (c.k * dd * dd).powi(2)).sqrt();
+                let lm = if laser_charge > 0.0 { c.laser_mul } else { 1.0 };
+                em / dd * lm
+            } else {
+                1.0
+            };
             let noisy = [sol[0] + self.err[0] * es, sol[1] + self.err[1] * es];
             want_aim = Some(noisy);
             let al = aligned(noisy);

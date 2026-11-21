@@ -216,10 +216,10 @@ fn run_match(st: &Arc<Statics>, cfg: &Arc<Cfg>, o: &Opts, idx: usize) -> Result<
     }
     let specs: Vec<SlotSpec> = layout.iter().map(|l| SlotSpec { external: l.0.is_some(), team: l.2 }).collect();
     let mut g = Game::new(st.clone(), cfg.clone(), seed, &specs);
-    if house::spawn_laser() {
+    if house::spawn_laser() || house::house_v() == 4 {
         // The recorded real hunter carried gun + laser within 5 s of spawning.
         for (s, l) in layout.iter().enumerate() {
-            if l.1.is_some() {
+            if l.1.map(house::spawn_laser_tier).unwrap_or(false) {
                 let ws = g.mechs[s].ws[cfg::WK::Laser.idx()].clone();
                 g.mechs[s].slots[1] = Some(Weapon::new(cfg::WK::Laser, &ws));
             }
@@ -668,6 +668,18 @@ fn main() {
         let f = |g: &dyn Fn(&SlotRes) -> f32| slots.iter().map(|s| g(s)).sum::<f32>() / slots.len() as f32;
         println!("bot {c}: `{cmd}` ({} slots)", slots.len());
         println!("  SCORE mean(16-place) = {ms:.3} +- {se:.3} (se)   mean place {:.2}", f(&|s| s.place as f32));
+        if std::env::var("SIM_HITSTATS").is_ok() {
+            let h = *game::HITSTATS.lock().unwrap();
+            let mut line = String::from("  HITSTATS house vs ext (hit%/shots) <40,40-80,80-120,120-160,160+: gun");
+            for b in 0..5 {
+                line.push_str(&format!(" {:.0}%/{}", 100.0 * h[5 + b] as f32 / h[b].max(1) as f32, h[b]));
+            }
+            line.push_str(" | laser");
+            for b in 0..5 {
+                line.push_str(&format!(" {:.0}%/{}", 100.0 * h[15 + b] as f32 / h[10 + b].max(1) as f32, h[10 + b]));
+            }
+            println!("{line}");
+        }
         println!("  kills {:.2}  survival {:.1}s  dealt {:.0}  taken {:.0}  cubes {:.1}", f(&|s| s.kills as f32), f(&|s| s.survival), f(&|s| s.dealt), f(&|s| s.taken), f(&|s| s.cubes as f32));
         let mut causes: BTreeMap<String, usize> = BTreeMap::new();
         let mut killers: BTreeMap<String, usize> = BTreeMap::new();
