@@ -35,11 +35,43 @@ struct Track {
     max_hp: f32,
     weapons: Vec<String>,
     charging: bool,
+    /// When we first saw its current laser charge (s), or -1.
+    charge_t0: f32,
     cubes: i32,
     seen_t: f32,
     first_t: f32,
     /// EMA of the angle between its aim and a perfect gun lead on us (rad): skill estimate.
     aerr: f32,
+}
+
+/// Per-opponent engagement record (MECHBOT_DUEL instrumentation).
+#[derive(Clone, Debug, Default)]
+struct Duel {
+    t0: f32,
+    last: f32,
+    dealt: f32,
+    taken: f32,
+    taken_other: f32,
+    my_hp0: f32,
+    their_hp0: f32,
+    their_hp: f32,
+    their_w: String,
+    their_cubes: i32,
+    my_cubes: i32,
+    my_w: String,
+    tk_laser: f32,
+    tk_gun: f32,
+    tk_light: f32,
+    tk_mortar: f32,
+    tk_rear: f32,
+    dl_laser: f32,
+    dl_gun: f32,
+    ticks: u32,
+    tg_ticks: u32,
+    st: [u32; 7],
+    sum_d: f32,
+    n_others: u32,
+    cover_ticks: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -120,6 +152,12 @@ pub struct Brain {
     sn_prev_charge: f32,
     sn_active: bool,
     sn_stat: [u32; 4],
+    duels: HashMap<i64, Duel>,
+    duel_on: bool,
+    juke_until: f32,
+    juke_dir: [f32; 2],
+    juke_src: i64,
+    akl_prev: [f32; 2],
     // config numbers
     pickup_radius: f32,
     cube_radius: f32,
@@ -194,6 +232,18 @@ pub struct Params {
     pub sn_cover: f32,
     pub sn_hyst: f32,
     pub sn_maxp: f32,
+    /// Laser juke: 1 = reverse lateral motion during an enemy's charge when no cover-dodge, 2 = always.
+    pub lj: f32,
+    /// Anti-lightning kite: keep out of arc range (this many m) of lightning bots, never hide from them.
+    pub akl: f32,
+    /// 1 = also when we carry lightning ourselves.
+    pub akl_own: f32,
+    /// Stand and fight (no retreat to cover) when the target is this close (m).
+    pub corner_d: f32,
+    /// Mortar arc throwers whenever ready (concussion pushes them out of range, drains energy).
+    pub mlz: f32,
+    pub lj_t0: f32,
+    pub lj_len: f32,
 }
 
 impl Default for Params {
@@ -247,6 +297,13 @@ impl Default for Params {
             sn_cover: 0.0,
             sn_hyst: 0.0,
             sn_maxp: 9.0,
+            lj: 0.0,
+            akl: 52.0,
+            akl_own: 0.0,
+            corner_d: 0.0,
+            mlz: 1.0,
+            lj_t0: 0.15,
+            lj_len: 0.6,
         }
     }
 }
@@ -308,6 +365,13 @@ impl Params {
                     "sn_cover" => p.sn_cover = x,
                     "sn_hyst" => p.sn_hyst = x,
                     "sn_maxp" => p.sn_maxp = x,
+                    "lj" => p.lj = x,
+                    "akl" => p.akl = x,
+                    "akl_own" => p.akl_own = x,
+                    "corner_d" => p.corner_d = x,
+                    "mlz" => p.mlz = x,
+                    "lj_t0" => p.lj_t0 = x,
+                    "lj_len" => p.lj_len = x,
                     _ => eprintln!("unknown param {k}"),
                 }
             }
@@ -464,6 +528,12 @@ impl Brain {
             sn_prev_charge: 0.0,
             sn_active: false,
             sn_stat: [0; 4],
+            duels: HashMap::new(),
+            juke_until: -1.0,
+            juke_dir: [0.0, 0.0],
+            juke_src: -1,
+            akl_prev: [0.0, 0.0],
+            duel_on: std::env::var("MECHBOT_DUEL").is_ok(),
             debug: std::env::var("MECHBOT_DEBUG").is_ok(),
             gstat: [0; 7],
             debug_every: std::env::var("MECHBOT_DEBUG").ok().and_then(|v| v.parse().ok()).unwrap_or(10).max(1),
@@ -476,8 +546,133 @@ impl Brain {
         self.roam_goal = None;
     }
 
+    fn duel_close(&self, id: i64, d: &Duel, why: &str) {
+        let n = d.tg_ticks.max(1) as f32;
+        eprintln!(
+            "DUEL id={} why={} t0={:.1} dur={:.1} dealt={:.0} taken={:.0} other={:.0} myhp0={:.0} hp0={:.0} hpend={:.0} tw={} tc={} mc={} mw={} tk_l={:.0} tk_g={:.0} tk_z={:.0} tk_m={:.0} rear={:.0} dl_l={:.0} dl_g={:.0} d={:.0} fire={:.2} nolos={:.2} rng={:.2} rel={:.2} aim={:.2} hold={:.2} oth={:.2} cov={:.2} tgf={:.2}",
+            id, why, d.t0, d.last - d.t0, d.dealt, d.taken, d.taken_other, d.my_hp0, d.their_hp0, d.their_hp, d.their_w, d.their_cubes, d.my_cubes, d.my_w,
+            d.tk_laser, d.tk_gun, d.tk_light, d.tk_mortar, d.tk_rear, d.dl_laser, d.dl_gun, d.sum_d / n,
+            d.st[1] as f32 / n, d.st[2] as f32 / n, d.st[3] as f32 / n, d.st[4] as f32 / n, d.st[5] as f32 / n, d.st[6] as f32 / n,
+            d.n_others as f32 / d.ticks.max(1) as f32, d.cover_ticks as f32 / d.ticks.max(1) as f32, d.tg_ticks as f32 / d.ticks.max(1) as f32
+        );
+    }
+
+    /// Per-opponent engagement bookkeeping (only with MECHBOT_DUEL).
+    fn duel_track(&mut self, obs: &Obs, mode: Mode, gst_before: [u32; 7]) {
+        let me = &obs.me;
+        let wn = |w: &Vec<String>| w.join("+");
+        let my_w: String = me.weapons.iter().flatten().map(|w| w.kind.clone()).collect::<Vec<_>>().join("+");
+        let mut touched: Vec<(i64, f32, bool, Option<String>, bool)> = vec![];
+        for e in &obs.events {
+            match e.kind.as_str() {
+                "damaged" => {
+                    if let Some(b) = e.by.filter(|b| *b < 100) {
+                        touched.push((b, e.amount.unwrap_or(0.0), true, e.weapon.clone(), e.rear.unwrap_or(false)));
+                    }
+                }
+                "hit" => {
+                    if let Some(tg) = e.target.filter(|b| *b < 100) {
+                        if self.tracks.contains_key(&tg) || self.duels.contains_key(&tg) {
+                            touched.push((tg, e.amount.unwrap_or(0.0), false, e.weapon.clone(), false));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (id, amt, taken, w, rear) in touched.iter().cloned() {
+            if !self.duels.contains_key(&id) {
+                let tr = self.tracks.get(&id);
+                self.duels.insert(
+                    id,
+                    Duel {
+                        t0: obs.t,
+                        last: obs.t,
+                        my_hp0: me.hp + if taken { amt } else { 0.0 },
+                        their_hp0: tr.map(|t| t.hp).unwrap_or(-1.0),
+                        their_hp: tr.map(|t| t.hp).unwrap_or(-1.0),
+                        their_w: tr.map(|t| wn(&t.weapons)).unwrap_or_default(),
+                        their_cubes: tr.map(|t| t.cubes).unwrap_or(-1),
+                        my_cubes: me.cubes,
+                        my_w: my_w.clone(),
+                        ..Default::default()
+                    },
+                );
+            }
+            let d = self.duels.get_mut(&id).unwrap();
+            d.last = obs.t;
+            if taken {
+                d.taken += amt;
+                match w.as_deref() {
+                    Some("laser") => d.tk_laser += amt,
+                    Some("gun") => d.tk_gun += amt,
+                    Some("lightning") => d.tk_light += amt,
+                    Some("mortar") => d.tk_mortar += amt,
+                    _ => {}
+                }
+                if rear {
+                    d.tk_rear += amt;
+                }
+            } else {
+                d.dealt += amt;
+                match w.as_deref() {
+                    Some("laser") => d.dl_laser += amt,
+                    Some("gun") => d.dl_gun += amt,
+                    _ => {}
+                }
+            }
+        }
+        let ids: Vec<i64> = self.duels.keys().copied().collect();
+        for id in &ids {
+            let other: f32 = touched.iter().filter(|x| x.2 && x.0 != *id).map(|x| x.1).sum();
+            let n_oth = touched.iter().filter(|x| x.2 && x.0 != *id).count();
+            let is_tg = self.target_id == Some(*id);
+            let tr = self.tracks.get(id).cloned();
+            let d = self.duels.get_mut(id).unwrap();
+            d.taken_other += other;
+            d.ticks += 1;
+            if n_oth > 0 {
+                d.n_others += 1;
+            }
+            if mode == Mode::Cover {
+                d.cover_ticks += 1;
+            }
+            if let Some(tr) = tr {
+                if obs.t - tr.seen_t < 0.01 {
+                    d.their_hp = tr.hp;
+                    d.their_w = wn(&tr.weapons);
+                }
+                if is_tg {
+                    d.tg_ticks += 1;
+                    d.sum_d += hdist(tr.pos, me.pos);
+                    for k in 1..7 {
+                        if self.gstat[k] > gst_before[k] {
+                            d.st[k] += 1;
+                        }
+                    }
+                }
+            }
+        }
+        let killed: Vec<i64> = obs.events.iter().filter(|e| e.kind == "kill").filter_map(|e| e.target).collect();
+        for id in ids {
+            let d = self.duels[&id].clone();
+            if killed.contains(&id) {
+                self.duel_close(id, &d, "kill");
+                self.duels.remove(&id);
+            } else if obs.t - d.last > 8.0 {
+                self.duel_close(id, &d, "split");
+                self.duels.remove(&id);
+            }
+        }
+    }
+
     pub fn log_end(&self, raw: &str) {
         eprintln!("end: {raw} gunstat[mech_ticks,fire,nolos,range,ammo/reload,aim,hold]={:?} sniper[peek,hide,nopair,_]={:?}", self.gstat, self.sn_stat);
+        if self.duel_on {
+            for (id, d) in &self.duels {
+                self.duel_close(*id, d, if self.t - d.last < 8.0 { "died" } else { "split" });
+            }
+        }
     }
 
     // ------------------------------------------------------------------ helpers --------
@@ -859,6 +1054,7 @@ impl Brain {
         self.dmg_log.retain(|d| obs.t - d.0 < 6.0);
         for m in obs.mechs.iter().filter(|m| m.is_mech() && m.id != me.id) {
             let first_t = self.tracks.get(&m.id).map(|t| t.first_t).unwrap_or(obs.t);
+            let charge_t0 = self.tracks.get(&m.id).filter(|t| t.charging && t.charge_t0 >= 0.0 && obs.t - t.seen_t < 0.3).map(|t| t.charge_t0).unwrap_or(obs.t);
             let mut aerr = self.tracks.get(&m.id).map(|t| t.aerr).unwrap_or(0.05);
             {
                 let d = hdist(m.pos, pos);
@@ -882,6 +1078,7 @@ impl Brain {
                     max_hp: m.max_hp.unwrap_or(1400.0),
                     weapons: m.weapons.clone(),
                     charging: m.charging,
+                    charge_t0: if m.charging { charge_t0 } else { -1.0 },
                     cubes: m.cubes.unwrap_or(0),
                     seen_t: obs.t,
                     first_t,
@@ -1033,7 +1230,7 @@ impl Brain {
         self.last_ttd = ttd;
         if self.retreating {
             let safe = hp_frac > 0.8 || enemies.is_empty() && obs.t - self.last_dmg_t > 10.0;
-            let cornered = tgt_d < 30.0 && ttk < ttd * 0.8;
+            let cornered = tgt_d < 30.0 && ttk < ttd * 0.8 || self.prm.corner_d > 0.0 && tgt_d < self.prm.corner_d && n_shooting <= 1;
             let winning = ttk < ttd * 0.9 && n_shooting <= 1 || ttk < 2.0 && ttk < ttd;
             if safe || cornered || winning {
                 self.retreating = false;
@@ -1041,7 +1238,8 @@ impl Brain {
         } else if target_mech.is_some() {
             let losing = ttk > ttd * self.prm.retreat_ratio && ttk > 2.5 && (hp_frac < self.prm.retreat_hp || n_shooting >= 2);
             let low = hp_frac < 0.3 && tgt_hp > me.hp * 0.5;
-            if losing || low {
+            let pinned = self.prm.corner_d > 0.0 && tgt_d < self.prm.corner_d && n_shooting <= 1;
+            if (losing || low) && !pinned {
                 self.retreating = true;
                 self.cover_goal = None;
             }
@@ -1088,6 +1286,7 @@ impl Brain {
         let mut want_boost = false;
         let mut take: Option<(i64, Option<usize>)> = None;
         let mut aux_target: Option<Target> = None; // non-mech target (npc/crate)
+        let gst_before = self.gstat;
 
         if zone_urgent {
             mode = Mode::Zone;
@@ -1594,6 +1793,106 @@ impl Brain {
             }
         }
 
+        // Anti-lightning kite: an arc thrower inside ~50 m out-damages anything we carry and
+        // follows us into cover, so back-pedal (torso keeps shooting) to stay out of its range.
+        let mut kiting = false;
+        if self.prm.akl > 0.0 && matches!(mode, Mode::Fight | Mode::Cover | Mode::Farm | Mode::Loot | Mode::Roam | Mode::Hold) && (!have_light || self.prm.akl_own > 0.5) {
+            let zappers: Vec<[f32; 2]> = enemies
+                .iter()
+                .filter(|m| m.has("lightning") && hdist(m.pos, pos) < self.prm.akl && (m.pos[2] - pos[2]).abs() < 12.0)
+                .map(|m| xy(m.pos))
+                .collect();
+            if !zappers.is_empty() {
+                let others: Vec<[f32; 2]> = enemies.iter().filter(|m| !m.has("lightning") && hdist(m.pos, pos) < 90.0).map(|m| xy(m.pos)).collect();
+                let mut best: Option<(f32, [f32; 2])> = None;
+                for k in 0..24 {
+                    let a = k as f32 * 2.0 * PI / 24.0;
+                    let dv = [a.cos(), a.sin()];
+                    let p4 = [p2[0] + dv[0] * 4.0, p2[1] + dv[1] * 4.0];
+                    let p9 = [p2[0] + dv[0] * 9.0, p2[1] + dv[1] * 9.0];
+                    if !self.nav.walkable_at(p4[0], p4[1]) {
+                        continue;
+                    }
+                    let far_ok = self.nav.walkable_at(p9[0], p9[1]) && self.nav.line_walkable(p2, p9);
+                    let mut sc = 0.0;
+                    for z in &zappers {
+                        sc += (dist2(p9, *z) - dist2(p2, *z)).min(9.0);
+                    }
+                    for o in &others {
+                        let dn = dist2(p9, *o);
+                        if dn < 40.0 {
+                            sc -= (40.0 - dn) * 0.15;
+                        }
+                    }
+                    if !far_ok {
+                        sc -= 6.0;
+                    }
+                    if dist2(p9, gc) > gr {
+                        sc -= 4.0 + (dist2(p9, gc) - gr);
+                    }
+                    sc += 2.0 * (dv[0] * self.akl_prev[0] + dv[1] * self.akl_prev[1]);
+                    if best.map(|b| sc > b.0).unwrap_or(true) {
+                        best = Some((sc, dv));
+                    }
+                }
+                if let Some((_, dv)) = best {
+                    mv = dv;
+                    self.akl_prev = dv;
+                    want_boost = true;
+                    kiting = true;
+                    self.dodge_goal = None;
+                    if mode == Mode::Cover {
+                        mode = Mode::Fight;
+                    }
+                }
+            }
+        }
+
+        // Laser juke: house lasers aim at where we were a reaction time ago plus our velocity
+        // then; a hard lateral reversal shortly before release makes that prediction miss.
+        if self.prm.lj > 0.0 && matches!(mode, Mode::Fight | Mode::Cover) && (self.dodge_goal.is_none() || self.prm.lj > 1.5 || mode == Mode::Cover) {
+            let me_c = [pos[0], pos[1], pos[2] + 4.5 * my_scale];
+            let mut best: Option<(f32, i64, [f32; 2])> = None;
+            for m in enemies.iter().filter(|m| m.charging) {
+                let Some(tr) = self.tracks.get(&m.id) else { continue };
+                let e = obs.t - tr.charge_t0;
+                let b = yaw_to(xy(m.pos), p2);
+                if wrap(m.aim[0] - b).abs() > 0.25 || !self.world.los(Self::eye_of(m.pos, 1.0 + 0.05 * m.cubes.unwrap_or(0) as f32), me_c) {
+                    continue;
+                }
+                if best.map(|x| e > x.0).unwrap_or(true) {
+                    best = Some((e, m.id, xy(m.pos)));
+                }
+            }
+            if let Some((e, id, ep)) = best {
+                let new_src = self.juke_src != id || obs.t > self.juke_until + 0.3;
+                if e >= self.prm.lj_t0 && e < self.prm.lj_t0 + self.prm.lj_len && (obs.t >= self.juke_until && new_src) {
+                    let b = yaw_to(ep, p2);
+                    let perp = [-b.sin(), b.cos()];
+                    let lat = me.vel[0] * perp[0] + me.vel[1] * perp[1];
+                    let mut dir = if lat > 0.0 { [-perp[0], -perp[1]] } else { perp };
+                    if !self.nav.walkable_at(p2[0] + dir[0] * 5.0, p2[1] + dir[1] * 5.0) {
+                        // can't reverse: stop dead instead (also breaks a linear lead)
+                        dir = [0.0, 0.0];
+                    }
+                    self.juke_dir = dir;
+                    self.juke_src = id;
+                    self.juke_until = obs.t + (self.prm.lj_t0 + self.prm.lj_len - e).max(0.1);
+                } else if e < self.prm.lj_t0 {
+                    // keep moving steadily so the reversal is as large as possible
+                    self.strafe_switch_t = self.strafe_switch_t.max(obs.t + 0.15);
+                }
+            }
+            if obs.t < self.juke_until {
+                mv = self.juke_dir;
+                want_boost = true;
+                let b = self.juke_dir;
+                if b != [0.0, 0.0] {
+                    self.strafe_switch_t = self.juke_until + 0.2;
+                }
+            }
+        }
+
         // Projectile dodge: steer away from bullets/shells predicted to hit us.
         if let Some(dv) = self.projectile_dodge(obs, my_scale) {
             let blend = unit2([mv[0] * 0.4 + dv[0], mv[1] * 0.4 + dv[1]]);
@@ -1639,7 +1938,7 @@ impl Brain {
 
         // ---- boost with energy hysteresis (keep a reserve for lightning)
         let reserve = if have_light { 45.0 } else { 12.0 };
-        if have_light && mode == Mode::Fight && tgt_d < 50.0 && self.prm.fboost < 0.5 {
+        if have_light && mode == Mode::Fight && tgt_d < 50.0 && self.prm.fboost < 0.5 && !kiting {
             want_boost = false;
         }
         if self.boosting {
@@ -1750,6 +2049,9 @@ impl Brain {
             }
         }
         self.mode = mode;
+        if self.duel_on {
+            self.duel_track(obs, mode, gst_before);
+        }
         let _ = my_scale;
         if self.debug && self.ticks % self.debug_every == 0 {
             eprintln!(
@@ -1874,7 +2176,8 @@ impl Brain {
             let dh = hdist(tg.pos, pos);
             let gun_busy = gun.map(|g| w(g).reload.unwrap_or(0.0) > 0.0 || w(g).ammo.unwrap_or(1.0) <= 0.0).unwrap_or(true);
             let laser_busy = laser.map(|l| w(l).charge.unwrap_or(0.0) > 0.0).unwrap_or(false);
-            if mw.cooldown <= 0.05 && dh > 22.0 && dh < 225.0 && (!los || gun_busy) && !laser_busy && allow {
+            let zapper = self.prm.mlz > 0.0 && dh < 70.0 && self.tracks.get(&tg.id).map(|t| t.weapons.iter().any(|w| w == "lightning")).unwrap_or(false);
+            if mw.cooldown <= 0.05 && dh > 22.0 && dh < 225.0 && (!los || gun_busy || zapper) && !laser_busy && allow {
                 let sp = mw.stat("speed", 72.0);
                 let g = mw.stat("gravity", self.gravity);
                 let tube = [pos[0], pos[1], pos[2] + statf(me, "height", 9.0) + 0.5];
