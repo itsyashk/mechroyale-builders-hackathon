@@ -175,6 +175,8 @@ pub struct Params {
     pub radw: f32,
     pub fboost: f32,
     pub finish: f32,
+    pub pick_until: f32,
+    pub pick_aerr: f32,
 }
 
 impl Default for Params {
@@ -217,6 +219,8 @@ impl Default for Params {
             radw: 1.2,
             fboost: 0.0,
             finish: 2.0,
+            pick_until: 0.0,
+            pick_aerr: 0.09,
         }
     }
 }
@@ -267,6 +271,8 @@ impl Params {
                     "radw" => p.radw = x,
                     "fboost" => p.fboost = x,
                     "finish" => p.finish = x,
+                    "pick_until" => p.pick_until = x,
+                    "pick_aerr" => p.pick_aerr = x,
                     _ => eprintln!("unknown param {k}"),
                 }
             }
@@ -947,6 +953,19 @@ impl Brain {
             })
             .unwrap_or(false);
         let _avoid = target_mech.is_some() && !engage_ok;
+        // Early on, leave alone bots that are not after us: only pick fights we chose well.
+        let mut target_mech = target_mech;
+        if obs.t < self.prm.pick_until {
+            if let Some((m, _)) = &target_mech {
+                let attacking = attackers.contains(&m.id) || (wrap(m.aim[0] - yaw_to(xy(m.pos), p2)).abs() < 0.2 && hdist(m.pos, pos) < 90.0);
+                let ae = self.tracks.get(&m.id).map(|t| t.aerr).unwrap_or(0.05);
+                let hurt = m.hp.unwrap_or(1400.0) < 0.5 * m.max_hp.unwrap_or(1400.0);
+                if !(attacking || tgt_d < 30.0 || ae > self.prm.pick_aerr || hurt) {
+                    target_mech = None;
+                    self.target_id = None;
+                }
+            }
+        }
         // Heal between fights: nobody is shooting us and we are hurt -> hide and regenerate
         // rather than starting the next fight.
         let under_fire = obs.t - self.last_dmg_t < 2.5;

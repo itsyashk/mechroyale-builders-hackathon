@@ -139,3 +139,26 @@ stuck on a building corner (it does not path).
   but there is no 64 KiB enforcement beyond dropping over-long lines.
 - **House bots** walk the ground nav grid only (no jets/roofs), do not use sound, and get
   hunting intel the real squad may not have.
+
+## House-bot models and calibration
+
+`SIM_HOUSE` picks the house-bot model:
+
+| Model | What it is | Score levels (our bot / kit example bot) |
+| --- | --- | --- |
+| `v1` (default) | Original guess: squad, first hunter at 45 s, angular aim error, non-hunters retaliate only within 40-55 m | ~3.5-4.0 / 0.54 (real board: 4.15-4.52 / 1.15) |
+| `v2` | Fitted to `kit/check/stream.jsonl.gz`: accurate leading aim at 150 m, hard jinking, laser at spawn (`SIM_SPAWN_LASER`), hunting from t=0 (`SIM_FIRST_HUNT`), `SIM_ENGAGE_MUL` | ~1.1-1.4 / 0.0: far too lethal |
+| `v3` | v1, plus aim error capped past 40 m, retaliation at any range, jinking every 0.25-0.6 s | ~2.6-3.1 / 0.34 |
+
+The recorded stream is not a practice match: three house bots die by t=25 s while the example
+bot scores no kills, which cannot happen when the squad never fights itself. A free-for-all does
+not fit the real board either (the example bot scores 6-8 there). Each real score comes from only
+48 matches, so its standard error is about 0.3.
+
+Tools:
+- `tools/streamstats.py FILE...`: first sighting, first damage, attackers, damage share by weapon,
+  and hit distances, from recorded observation streams.
+- `tools/teebot.sh CMD...`: wraps a bot so its observations are saved to `$TEE_DIR`, for example
+  `--bot "sh tools/teebot.sh python3 -u kit/python/example_bot.py"`.
+- `tools/calib.sh M SEED "ENV=.."...` (and `calib_ffa.sh`): scores the d547b5b and 73be899
+  parameter sets under each house model.

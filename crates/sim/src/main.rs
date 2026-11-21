@@ -15,7 +15,7 @@ mod util;
 use cfg::Cfg;
 use ext::ExtBot;
 use game::*;
-use house::{Brain, Squad, PRACTICE_TIERS, SQUAD_TEAM, TIERS};
+use house::{tiers, Brain, Squad, PRACTICE_TIERS, SQUAD_TEAM};
 use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -167,7 +167,7 @@ struct MatchRes {
 }
 
 fn tier_name(t: Option<usize>) -> &'static str {
-    t.map(|k| TIERS[k].name).unwrap_or("ext")
+    t.map(|k| tiers()[k].name).unwrap_or("ext")
 }
 
 fn run_match(st: &Arc<Statics>, cfg: &Arc<Cfg>, o: &Opts, idx: usize) -> Result<MatchRes, String> {
@@ -216,6 +216,15 @@ fn run_match(st: &Arc<Statics>, cfg: &Arc<Cfg>, o: &Opts, idx: usize) -> Result<
     }
     let specs: Vec<SlotSpec> = layout.iter().map(|l| SlotSpec { external: l.0.is_some(), team: l.2 }).collect();
     let mut g = Game::new(st.clone(), cfg.clone(), seed, &specs);
+    if house::spawn_laser() {
+        // The recorded real hunter carried gun + laser within 5 s of spawning.
+        for (s, l) in layout.iter().enumerate() {
+            if l.1.is_some() {
+                let ws = g.mechs[s].ws[cfg::WK::Laser.idx()].clone();
+                g.mechs[s].slots[1] = Some(Weapon::new(cfg::WK::Laser, &ws));
+            }
+        }
+    }
     let mut nav = arena::Nav::build(&st.w);
     let mut brains: Vec<Option<Brain>> = layout.iter().enumerate().map(|(s, l)| l.1.map(|t| Brain::new(t, l.2 == Some(SQUAD_TEAM), mix_seed(seed, 100 + s as u64), n))).collect();
     let n_squad = layout.iter().filter(|l| l.2 == Some(SQUAD_TEAM)).count();
@@ -691,11 +700,11 @@ fn main() {
     }
     if o.mode == Mode::Ffa {
         let full = o.full || o.bots.is_empty();
-        for tier in 0..TIERS.len() {
+        for tier in 0..tiers().len() {
             let house: Vec<f32> = res.iter().flat_map(|r| r.slots.iter()).filter(|s| s.cmd.is_none() && s.tier == Some(tier)).map(|s| 16.0 - s.place as f32).collect();
             if !house.is_empty() && full {
                 let (m, se) = mean_se(&house);
-                println!("house filler {:>6}: mean(16-place) = {m:.3} +- {se:.3} ({} slots)", TIERS[tier].name, house.len());
+                println!("house filler {:>6}: mean(16-place) = {m:.3} +- {se:.3} ({} slots)", tiers()[tier].name, house.len());
             }
         }
         if !full {

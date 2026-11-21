@@ -9,7 +9,66 @@ use arena::Nav;
 
 pub const SQUAD_TEAM: u8 = 1;
 /// The first hunter is sent at this match time (s).
-pub const FIRST_HUNT_S: f32 = 45.0;
+pub const FIRST_HUNT_S_V1: f32 = 45.0;
+
+/// House model (`SIM_HOUSE`): v1 (default; its score levels sit ~0.6-0.8 below the real board for
+/// both the kit example bot and ours), v2 (accurate long-range laser bots hunting from t=0, as in
+/// kit/check/stream.jsonl.gz, which is not a practice match: house bots die there by 25 s; far too
+/// lethal: ~1.3 for us), v3 (v1 with aim error capped past 40 m, retaliation at any range, hard
+/// jinking).
+pub fn house_v() -> u8 {
+    static V: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *V.get_or_init(|| match std::env::var("SIM_HOUSE").as_deref() {
+        Ok("v1") | Ok("1") => 1,
+        Ok("v2") | Ok("2") => 2,
+        Ok("v3") | Ok("3") => 3,
+        _ => 1,
+    })
+}
+
+pub fn tiers() -> &'static [Tier; 4] {
+    match house_v() {
+        1 => &TIERS_V1,
+        2 => &TIERS_V2,
+        _ => &TIERS_V3,
+    }
+}
+
+/// Model 3: model 1's squad, schedule and engagement, but no free lunch at range: aim
+/// error stops growing past 40 m (the recorded real bot hit a jinking target at ~150 m) and bots
+/// fight back against an attacker at any range.
+pub static TIERS_V3: std::sync::LazyLock<[Tier; 4]> = std::sync::LazyLock::new(|| {
+    let mut t = TIERS_V1.clone();
+    for x in t.iter_mut() {
+        x.retaliate_range = 230.0;
+        // the recorded bot reversed its strafe every ~0.3-0.5 s
+        x.strafe = x.strafe.max(0.75);
+        x.strafe_period = (0.25, 0.6);
+    }
+    t
+});
+
+/// Calibration knobs for model 2 (env): SIM_FIRST_HUNT (s), SIM_SPAWN_LASER (0/1), SIM_ENGAGE_MUL.
+pub fn env_f(k: &str, d: f32) -> f32 {
+    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+}
+
+pub fn first_hunt_s() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| match house_v() {
+        1 | 3 => FIRST_HUNT_S_V1,
+        _ => env_f("SIM_FIRST_HUNT", 0.0),
+    })
+}
+
+pub fn engage_mul() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| if house_v() == 2 { env_f("SIM_ENGAGE_MUL", 1.0) } else { 1.0 })
+}
+
+pub fn spawn_laser() -> bool {
+    house_v() == 2 && env_f("SIM_SPAWN_LASER", 1.0) > 0.5
+}
 
 /// Per-tier behaviour knobs. Tune here.
 #[derive(Clone, Debug)]
@@ -62,7 +121,8 @@ pub struct Tier {
     pub combat_boost: bool,
 }
 
-pub const TIERS: [Tier; 4] = [
+/// Original guess (house bots weak, short-range, hunt from 45 s). `SIM_HOUSE=v1`.
+pub const TIERS_V1: [Tier; 4] = [
     Tier {
         name: "easy",
         aim_sigma: 0.11,
@@ -165,6 +225,110 @@ pub const TIERS: [Tier; 4] = [
     },
 ];
 
+/// Calibrated to the recorded (non-practice) real match.
+pub const TIERS_V2: [Tier; 4] = [
+    Tier {
+        name: "easy",
+        aim_sigma: 0.02,
+        aim_tau: 0.6,
+        reaction_s: 0.4,
+        lead: 0.85,
+        track_rate: 3.0,
+        fire_tol: 1.2,
+        strafe: 0.7,
+        strafe_period: (0.3, 0.7),
+        jump_rate: 0.0,
+        engage_range: 45.0,
+        ffa_engage_range: 70.0,
+        laser_release: 0.95,
+        mortar_lob: false,
+        loot_radius: 90.0,
+        farm_npc: false,
+        drops: false,
+        weapon_pref: [WK::Laser, WK::Mortar, WK::Lightning],
+        upgrade_pref: &[],
+        intel_s: 3.0,
+        retaliate_range: 120.0,
+        retreat_hp: 0.0,
+        combat_boost: false,
+    },
+    Tier {
+        name: "medium",
+        aim_sigma: 0.014,
+        aim_tau: 0.6,
+        reaction_s: 0.3,
+        lead: 0.9,
+        track_rate: 3.5,
+        fire_tol: 1.1,
+        strafe: 0.8,
+        strafe_period: (0.3, 0.6),
+        jump_rate: 0.05,
+        engage_range: 50.0,
+        ffa_engage_range: 100.0,
+        laser_release: 1.0,
+        mortar_lob: false,
+        loot_radius: 110.0,
+        farm_npc: false,
+        drops: false,
+        weapon_pref: [WK::Laser, WK::Lightning, WK::Mortar],
+        upgrade_pref: &["armor", "plating", "gun_rate", "gun_damage"],
+        intel_s: 2.5,
+        retaliate_range: 120.0,
+        retreat_hp: 0.0,
+        combat_boost: false,
+    },
+    Tier {
+        name: "hard",
+        aim_sigma: 0.01,
+        aim_tau: 0.5,
+        reaction_s: 0.2,
+        lead: 1.0,
+        track_rate: 4.0,
+        fire_tol: 1.0,
+        strafe: 0.85,
+        strafe_period: (0.25, 0.55),
+        jump_rate: 0.12,
+        engage_range: 55.0,
+        ffa_engage_range: 50.0,
+        laser_release: 1.0,
+        mortar_lob: true,
+        loot_radius: 130.0,
+        farm_npc: true,
+        drops: true,
+        weapon_pref: [WK::Laser, WK::Mortar, WK::Lightning],
+        upgrade_pref: &["armor", "plating", "gun_rate", "laser_damage", "gun_damage", "gyros", "nanites"],
+        intel_s: 2.0,
+        retaliate_range: 120.0,
+        retreat_hp: 0.3,
+        combat_boost: true,
+    },
+    Tier {
+        name: "expert",
+        aim_sigma: 0.006,
+        aim_tau: 0.5,
+        reaction_s: 0.12,
+        lead: 1.0,
+        track_rate: 6.0,
+        fire_tol: 0.9,
+        strafe: 0.9,
+        strafe_period: (0.25, 0.5),
+        jump_rate: 0.2,
+        engage_range: 60.0,
+        ffa_engage_range: 60.0,
+        laser_release: 1.0,
+        mortar_lob: true,
+        loot_radius: 150.0,
+        farm_npc: true,
+        drops: true,
+        weapon_pref: [WK::Laser, WK::Lightning, WK::Mortar],
+        upgrade_pref: &["armor", "gun_rate", "plating", "laser_damage", "laser_charge", "gun_damage", "gyros", "nanites", "servos"],
+        intel_s: 1.5,
+        retaliate_range: 120.0,
+        retreat_hp: 0.35,
+        combat_boost: true,
+    },
+];
+
 /// The practice line-up: 4 easy, 4 medium, 4 hard, 3 expert.
 pub const PRACTICE_TIERS: [usize; 15] = [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3];
 
@@ -240,7 +404,7 @@ impl Squad {
         // Hunter schedule: one early, +1 per fallen squad mate, +1 per minute after the
         // first, everyone after 5 minutes or once only 4 remain. Weakest tier first.
         let alive = members.len();
-        let mut k = if t >= FIRST_HUNT_S { 1 } else { 0 } + self.total.saturating_sub(alive);
+        let mut k = if t >= first_hunt_s() { 1 } else { 0 } + self.total.saturating_sub(alive);
         if t > 60.0 {
             k += ((t - 60.0) / 60.0) as usize;
         }
@@ -340,7 +504,8 @@ impl Brain {
     }
 
     pub fn decide(&mut self, g: &Game, me: usize, squad: &Squad, nav: &mut Nav) -> Cmd {
-        let tier = TIERS[self.tier].clone();
+        let mut tier = tiers()[self.tier].clone();
+        tier.engage_range *= engage_mul();
         let t = g.t;
         let m = &g.mechs[me];
         let pos = m.pos;
@@ -450,18 +615,31 @@ impl Brain {
                 }
             }
             v.d = dist(v.pos, pos);
-            want_range = if has(WK::Lightning) {
-                24.0
+            want_range = if house_v() != 2 {
+                let w = if has(WK::Lightning) {
+                    24.0
+                } else if has(WK::Laser) {
+                    95.0
+                } else if has(WK::Mortar) {
+                    80.0
+                } else {
+                    55.0
+                };
+                if self.tier == 0 {
+                    w * 1.3
+                } else {
+                    w
+                }
             } else if has(WK::Laser) {
-                95.0
+                // the recorded hunter held 90-150 m with gun + laser
+                125.0
+            } else if has(WK::Lightning) {
+                28.0
             } else if has(WK::Mortar) {
-                80.0
+                90.0
             } else {
-                55.0
+                85.0
             };
-            if self.tier == 0 {
-                want_range *= 1.3;
-            }
             tv = Some(v);
         } else {
             self.cur = None;
@@ -530,7 +708,7 @@ impl Brain {
                     let d = dist2d(&p.pos, &pos);
                     let pref = tier.weapon_pref.iter().position(|&w| w == p.w.kind).unwrap_or(3) as f32;
                     let sc2 = d + pref * 25.0;
-                    if d < tier.loot_radius * if hunter { 0.4 } else { 1.0 } && (p.pos[2] - g.st.w.ground(p.pos[0], p.pos[1])).abs() < 1.5 && in_safe(&p.pos) && bp.map(|b| sc2 < b.0).unwrap_or(true) {
+                    if d < tier.loot_radius * if hunter && house_v() != 2 { 0.4 } else { 1.0 } && (p.pos[2] - g.st.w.ground(p.pos[0], p.pos[1])).abs() < 1.5 && in_safe(&p.pos) && bp.map(|b| sc2 < b.0).unwrap_or(true) {
                         bp = Some((sc2, k));
                     }
                 }
@@ -687,7 +865,8 @@ impl Brain {
             } else {
                 self.mortar_mode = false;
             }
-            let noisy = [sol[0] + self.err[0], sol[1] + self.err[1]];
+            let es = if house_v() == 3 { (40.0 / v.d.max(1.0)).min(1.0) } else { 1.0 };
+            let noisy = [sol[0] + self.err[0] * es, sol[1] + self.err[1] * es];
             want_aim = Some(noisy);
             let al = aligned(noisy);
             for s in 0..2 {
