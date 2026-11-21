@@ -100,6 +100,8 @@ pub struct Brain {
     dodge_check_t: f32,
     dodges: u32,
     last_ttk: f32,
+    escape_until: f32,
+    escape_goal: [f32; 2],
     last_ttd: f32,
     // config numbers
     pickup_radius: f32,
@@ -202,6 +204,8 @@ impl Brain {
             dodge_check_t: -1.0,
             dodges: 0,
             last_ttk: 0.0,
+            escape_until: -1.0,
+            escape_goal: [0.0, 0.0],
             last_ttd: 0.0,
             debug: std::env::var("MECHBOT_DEBUG").is_ok(),
             debug_every: std::env::var("MECHBOT_DEBUG").ok().and_then(|v| v.parse().ok()).unwrap_or(10).max(1),
@@ -266,6 +270,15 @@ impl Brain {
             self.path = self.nav.path(pos, goal, 60_000);
             self.path_goal = goal;
             self.path_t = self.t;
+            // Unreachable on foot (walled pocket, roof): jet straight over toward the goal.
+            let end = self.path.last().copied().unwrap_or(pos);
+            if dist2(end, goal) > 10.0 && dist2(pos, goal) > 10.0 && dist2(end, pos) < 12.0 {
+                self.escape_until = self.t + 2.5;
+                self.escape_goal = goal;
+            }
+        }
+        if self.t < self.escape_until {
+            return unit2([self.escape_goal[0] - pos[0], self.escape_goal[1] - pos[1]]);
         }
         while let Some(&w) = self.path.first() {
             if dist2(w, pos) < 2.2 && self.path.len() > 1 {
@@ -440,6 +453,9 @@ impl Brain {
             match e.kind.as_str() {
                 "damaged" => {
                     self.last_dmg_t = obs.t;
+                    if self.debug {
+                        eprintln!("  dmg t={:.1} {:?} by={:?} amt={:.0} rear={:?}", obs.t, e.weapon, e.by, e.amount.unwrap_or(0.0), e.rear);
+                    }
                     if let Some(b) = e.bearing {
                         self.dmg_log.push((obs.t, b, e.by, e.amount.unwrap_or(0.0)));
                     }
@@ -593,11 +609,12 @@ impl Brain {
         if self.retreating {
             let safe = hp_frac > 0.8 || enemies.is_empty() && obs.t - self.last_dmg_t > 10.0;
             let cornered = tgt_d < 30.0 && ttk < ttd * 0.8;
-            if safe || cornered {
+            let winning = ttk < ttd * 0.9 && n_shooting <= 1 || ttk < 2.0 && ttk < ttd;
+            if safe || cornered || winning {
                 self.retreating = false;
             }
         } else if target_mech.is_some() {
-            let losing = ttk > ttd * 0.85 && (hp_frac < 0.6 || n_shooting >= 2);
+            let losing = ttk > ttd * 0.85 && ttk > 2.5 && (hp_frac < 0.6 || n_shooting >= 2);
             let low = hp_frac < 0.3 && tgt_hp > me.hp * 0.5;
             if losing || low {
                 self.retreating = true;
@@ -675,7 +692,8 @@ impl Brain {
                     continue;
                 }
                 let d = hdist(*pp, pos);
-                if d > 150.0 {
+                let reach = if slot_kind(1).is_empty() || slot_kind(0).is_empty() { 260.0 } else { 150.0 };
+                if d > reach {
                     continue;
                 }
                 let s = d - gain * 25.0;
@@ -819,7 +837,7 @@ impl Brain {
                         (45.0, 140.0)
                     }
                 } else if m.has("lightning") {
-                    (50.0, 90.0)
+                    (56.0, 95.0)
                 } else {
                     (18.0, 55.0)
                 };
@@ -948,6 +966,11 @@ impl Brain {
         while self.pos_hist.front().map(|f| obs.t - f.0 > 1.6).unwrap_or(false) {
             self.pos_hist.pop_front();
         }
+        if obs.t < self.escape_until {
+            act.jump = me.grounded;
+            want_boost = true;
+            self.boosting = true;
+        }
         if obs.t < self.unstick_until {
             mv = self.unstick_dir;
             act.jump = me.grounded;
@@ -978,6 +1001,9 @@ impl Brain {
             self.boosting = true;
         }
         act.boost = want_boost && self.boosting && (mv[0].abs() + mv[1].abs() > 0.2);
+        if obs.t < self.escape_until {
+            act.boost = me.energy > 1.0;
+        }
         if act.jump {
             act.boost = me.energy > 5.0;
         }
@@ -1005,7 +1031,12 @@ impl Brain {
                 b
             } else {
                 let base = if mv[0].abs() + mv[1].abs() > 0.1 { mv[1].atan2(mv[0]) } else { me.aim[0] };
-                base + (obs.t * 1.1).sin() * 1.1
+                if self.tracks.values().any(|t| obs.t - t.seen_t < 8.0) {
+                    base + (obs.t * 1.1).sin() * 1.1
+                } else {
+                    // Nobody around: spin the torso to find loot and threats all around.
+                    me.aim[0] + 1.2
+                }
             };
             aim = Some([yaw, 0.0]);
             // Top up the magazine when quiet.
