@@ -84,6 +84,8 @@ pub struct V4 {
     pub all_hunt: f32,
     /// Extra hunters per minute after the first minute (0 = only per fallen mate). `SIM_V4_PERMIN`
     pub per_min: f32,
+    /// Extra hunters per fallen squad mate. `SIM_V4_PER_KILL`
+    pub per_kill: f32,
     /// Aim error (1 sigma, metres at the target) = sqrt(c0^2 + (k d^2)^2) x tier mult. `SIM_V4_C0`, `SIM_V4_K`
     pub c0: f32,
     pub k: f32,
@@ -109,6 +111,7 @@ pub fn v4() -> &'static V4 {
         first_hunt: env_f("SIM_V4_FIRST", 5.0),
         all_hunt: env_f("SIM_V4_ALL", 300.0),
         per_min: env_f("SIM_V4_PERMIN", 0.0),
+        per_kill: env_f("SIM_V4_PER_KILL", 1.0),
         c0: env_f("SIM_V4_C0", 1.4),
         k: env_f("SIM_V4_K", 2.9e-4),
         laser_mul: env_f("SIM_V4_LASERMUL", 0.35),
@@ -490,6 +493,7 @@ impl Squad {
         let v4m = house_v() == 4;
         if v4m {
             let c = v4();
+            k = if t >= first_hunt_s() { 1 } else { 0 } + (self.total.saturating_sub(alive) as f32 * c.per_kill) as usize;
             if t > 60.0 {
                 k += ((t - 60.0) / 60.0 * c.per_min) as usize;
             }
