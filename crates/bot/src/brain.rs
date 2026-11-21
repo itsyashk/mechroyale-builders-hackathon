@@ -101,6 +101,8 @@ pub struct Brain {
     dodges: u32,
     last_ttk: f32,
     prm: Params,
+    tac_t: f32,
+    tac_goal: Option<[f32; 2]>,
     escape_until: f32,
     allow_escape: bool,
     escape_goal: [f32; 2],
@@ -149,6 +151,8 @@ pub struct Params {
     pub drops: f32,
     pub upg: f32,
     pub magnet: f32,
+    pub tactic: f32,
+    pub heal: f32,
 }
 
 impl Default for Params {
@@ -173,6 +177,8 @@ impl Default for Params {
             drops: 1.0,
             upg: 0.0,
             magnet: 50.0,
+            tactic: 0.0,
+            heal: 0.0,
         }
     }
 }
@@ -205,6 +211,8 @@ impl Params {
                     "drops" => p.drops = x,
                     "upg" => p.upg = x,
                     "magnet" => p.magnet = x,
+                    "tactic" => p.tactic = x,
+                    "heal" => p.heal = x,
                     _ => eprintln!("unknown param {k}"),
                 }
             }
@@ -319,6 +327,8 @@ impl Brain {
             dodges: 0,
             last_ttk: 0.0,
             prm: Params::from_env(),
+            tac_t: -1.0,
+            tac_goal: None,
             escape_until: -1.0,
             allow_escape: true,
             escape_goal: [0.0, 0.0],
@@ -763,6 +773,11 @@ impl Brain {
             })
             .unwrap_or(false);
         let _avoid = target_mech.is_some() && !engage_ok;
+        // Heal between fights: nobody is shooting us and we are hurt -> hide and regenerate
+        // rather than starting the next fight.
+        let under_fire = obs.t - self.last_dmg_t < 2.5;
+        let target_attacking = target_mech.as_ref().map(|(m, _)| attackers.contains(&m.id)).unwrap_or(false);
+        let healing = self.prm.heal > 0.0 && hp_frac < self.prm.heal && !under_fire && !target_attacking && tgt_d > 40.0;
 
         // ---- choose mode
         let mut mode;
@@ -776,7 +791,7 @@ impl Brain {
             mode = Mode::Zone;
             goal = Some(Self::clamp_into(p2, gc, gr * 0.7));
             want_boost = !me.in_zone;
-        } else if target_mech.is_some() && (self.retreating || sniper || self.prm.engage_all < 0.5 && _avoid) {
+        } else if target_mech.is_some() && (self.retreating || sniper || healing || self.prm.engage_all < 0.5 && _avoid) {
             mode = Mode::Cover;
         } else if target_mech.is_some() {
             mode = Mode::Fight;
@@ -997,6 +1012,59 @@ impl Brain {
                     }
                     mv = cand;
                     want_boost = true;
+                }
+            }
+        }
+
+        // Tactical position: with several enemies around, fight from a spot that sees the
+        // target but is hidden from the others.
+        if mode == Mode::Fight && self.prm.tactic > 0.5 && threat_eyes.len() >= 2 {
+            if let Some((m, _)) = &target_mech {
+                let tsc = 1.0 + 0.05 * m.cubes.unwrap_or(0) as f32;
+                let tc = [m.pos[0], m.pos[1], m.pos[2] + 4.5 * tsc];
+                let teye = Self::eye_of(m.pos, tsc);
+                if obs.t > self.tac_t {
+                    self.tac_t = obs.t + 0.5;
+                    let others: Vec<V3> = threat_eyes
+                        .iter()
+                        .copied()
+                        .filter(|e| ((e[0] - teye[0]).powi(2) + (e[1] - teye[1]).powi(2)).sqrt() > 1.0)
+                        .collect();
+                    let here_exposed = others.iter().filter(|e| self.world.los(**e, me_c)).count();
+                    let mut best: Option<(f32, [f32; 2])> = None;
+                    for &r in &[0.0f32, 4.0, 8.0, 13.0, 19.0] {
+                        let n = if r == 0.0 { 1 } else { 16 };
+                        for k in 0..n {
+                            let a = k as f32 * 2.0 * PI / n as f32;
+                            let c = [p2[0] + r * a.cos(), p2[1] + r * a.sin()];
+                            if r > 0.0 && !self.nav.walkable_at(c[0], c[1]) {
+                                continue;
+                            }
+                            if dist2(c, gc) > gr {
+                                continue;
+                            }
+                            let g = self.world.ground(c[0], c[1]);
+                            let muz = [c[0], c[1], g + muzzle_h];
+                            if !self.world.los(muz, tc) {
+                                continue;
+                            }
+                            let cc = [c[0], c[1], g + 4.5 * my_scale];
+                            let exposed = others.iter().filter(|e| self.world.los(**e, cc)).count();
+                            let dt = dist2(c, xy(m.pos));
+                            let score = -(exposed as f32) * 100.0 - r * 1.5 - if dt < 20.0 { (20.0 - dt) * 3.0 } else { 0.0 };
+                            if best.map(|b| score > b.0).unwrap_or(true) {
+                                best = Some((score, c));
+                            }
+                        }
+                    }
+                    self.tac_goal = best.filter(|b| dist2(b.1, p2) > 2.0 && b.0 > -(here_exposed as f32) * 100.0 + 20.0).map(|b| b.1);
+                }
+                if let Some(g) = self.tac_goal {
+                    if dist2(g, p2) > 1.5 {
+                        mv = self.goto(p2, g);
+                    } else {
+                        self.tac_goal = None;
+                    }
                 }
             }
         }
