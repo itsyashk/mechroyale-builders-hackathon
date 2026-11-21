@@ -375,8 +375,8 @@ impl Default for Params {
             mclus: 0.0,
             lcook: 0.0,
             memt: 0.0,
-            nlr: 2.0,
-            nlr_t: 90.0,
+            nlr: 3.0,
+            nlr_t: 999.0,
             nlr_d: 35.0,
         }
     }
@@ -1524,7 +1524,7 @@ impl Brain {
         }
         // No-laser restraint: while we only have the gun, don't start fights with laser bots
         // (nlr=1) or with anyone (nlr=2) that is not after us; keep looting for a laser instead.
-        if self.prm.nlr > 0.0 && !have_laser && obs.t < self.prm.nlr_t {
+        if self.prm.nlr > 0.0 && (!have_laser || self.prm.nlr > 2.5) && obs.t < self.prm.nlr_t {
             if let Some((m, _)) = &target_mech {
                 let attacking = attackers.contains(&m.id) || (wrap(m.aim[0] - yaw_to(xy(m.pos), p2)).abs() < 0.2 && hdist(m.pos, pos) < 120.0);
                 let hurt = m.hp.unwrap_or(1400.0) < 0.5 * m.max_hp.unwrap_or(1400.0);
