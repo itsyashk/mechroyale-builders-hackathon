@@ -366,7 +366,7 @@ impl Default for Params {
             mlz: 1.0,
             lj_t0: 0.15,
             lj_len: 0.6,
-            chg_gun: 1.0,
+            chg_gun: 0.0,
             lrel: 1.0,
             llead: 0.1,
             lupg: 0.0,
@@ -375,7 +375,7 @@ impl Default for Params {
             mclus: 0.0,
             lcook: 0.0,
             memt: 0.0,
-            nlr: 0.0,
+            nlr: 2.0,
             nlr_t: 90.0,
             nlr_d: 35.0,
         }
