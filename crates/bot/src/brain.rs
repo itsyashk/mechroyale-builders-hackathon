@@ -290,6 +290,8 @@ pub struct Params {
     pub lhold: f32,
     /// Mortar slow/clustered targets even with a working gun in LOS.
     pub mclus: f32,
+    /// Target-score bonus (m) for mortar carriers while we hold a laser (cook-off).
+    pub lcook: f32,
 }
 
 impl Default for Params {
@@ -350,13 +352,14 @@ impl Default for Params {
             mlz: 1.0,
             lj_t0: 0.15,
             lj_len: 0.6,
-            chg_gun: 0.0,
+            chg_gun: 1.0,
             lrel: 1.0,
             llead: 0.1,
             lupg: 0.0,
             lcov: 1.0,
             lhold: 0.0,
             mclus: 0.0,
+            lcook: 0.0,
         }
     }
 }
@@ -432,6 +435,7 @@ impl Params {
                     "lcov" => p.lcov = x,
                     "lhold" => p.lhold = x,
                     "mclus" => p.mclus = x,
+                    "lcook" => p.lcook = x,
                     _ => eprintln!("unknown param {k}"),
                 }
             }
@@ -1253,6 +1257,10 @@ impl Brain {
             s -= dmg_by(m.id, &self.dmg_log) * 0.25;
             if Some(m.id) == self.target_id {
                 s -= 30.0;
+            }
+            // Laser cook-off: +60% to mortar carriers.
+            if self.prm.lcook > 0.0 && m.has("mortar") && me.weapons.iter().flatten().any(|w| w.kind == "laser") {
+                s -= self.prm.lcook;
             }
             if self.prm.finish > 0.0 {
                 let mh = m.max_hp.unwrap_or(1400.0).max(1.0);
