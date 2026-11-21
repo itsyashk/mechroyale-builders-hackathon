@@ -94,6 +94,10 @@ pub struct Brain {
     boosting: bool,
     mode: Mode,
     ticks: u64,
+    debug: bool,
+    dodge_goal: Option<[f32; 2]>,
+    dodge_check_t: f32,
+    dodges: u32,
     // config numbers
     pickup_radius: f32,
     cube_radius: f32,
@@ -191,6 +195,10 @@ impl Brain {
             boosting: false,
             mode: Mode::Roam,
             ticks: 0,
+            dodge_goal: None,
+            dodge_check_t: -1.0,
+            dodges: 0,
+            debug: std::env::var("MECHBOT_DEBUG").is_ok(),
         })
     }
 
@@ -277,11 +285,14 @@ impl Brain {
     }
 
     /// Search for a walkable spot near `pos` hidden from every threat eye.
-    fn find_cover(&mut self, pos: V3, threats: &[V3], circle: ([f32; 2], f32), away_from: Option<[f32; 2]>) -> Option<[f32; 2]> {
+    fn find_cover(&mut self, pos: V3, threats: &[V3], circle: ([f32; 2], f32), away_from: Option<[f32; 2]>, max_r: f32) -> Option<[f32; 2]> {
         let mut best: Option<(f32, [f32; 2])> = None;
         let rings = [5.0f32, 9.0, 14.0, 20.0, 28.0, 38.0];
         let n_dir = 20;
         for (ri, &r) in rings.iter().enumerate() {
+            if r > max_r {
+                break;
+            }
             for k in 0..n_dir {
                 let a = (k as f32 + 0.5 * (ri % 2) as f32) * 2.0 * PI / n_dir as f32;
                 let c = [pos[0] + r * a.cos(), pos[1] + r * a.sin()];
@@ -646,7 +657,7 @@ impl Brain {
                     Some((_, t0)) => obs.t - t0 > 1.0,
                 };
                 if need_new {
-                    let c = self.find_cover(pos, &threat_eyes, (gc, gr), if self.retreating { away } else { None });
+                    let c = self.find_cover(pos, &threat_eyes, (gc, gr), if self.retreating { away } else { None }, 40.0);
                     self.cover_goal = c.map(|c| (c, obs.t));
                 }
                 match self.cover_goal {
@@ -755,6 +766,34 @@ impl Brain {
             mv = self.goto(p2, g);
         }
 
+        // Laser dodge: an enemy charging at us with a clear line -> duck into nearby cover.
+        if matches!(mode, Mode::Fight | Mode::Farm | Mode::Roam | Mode::Loot) {
+            let me_c = [pos[0], pos[1], pos[2] + 4.5 * my_scale];
+            let charger = enemies
+                .iter()
+                .filter(|m| m.charging)
+                .find(|m| {
+                    let b = yaw_to(xy(m.pos), p2);
+                    wrap(m.aim[0] - b).abs() < 0.15 && self.world.los(Self::eye_of(m.pos, 1.0), me_c)
+                })
+                .map(|m| Self::eye_of(m.pos, 1.0 + 0.05 * m.cubes.unwrap_or(0) as f32));
+            if let Some(ce) = charger {
+                if obs.t > self.dodge_check_t {
+                    self.dodge_goal = self.find_cover(pos, &[ce], (gc, gr + 10.0), None, 14.0);
+                    self.dodge_check_t = obs.t + 0.3;
+                }
+                if let Some(c) = self.dodge_goal {
+                    if dist2(c, p2) > 1.0 {
+                        mv = self.goto(p2, c);
+                        want_boost = true;
+                        self.dodges += 1;
+                    }
+                }
+            } else {
+                self.dodge_goal = None;
+            }
+        }
+
         // Keep inside the goal circle while fighting / farming.
         if matches!(mode, Mode::Fight | Mode::Farm) && dist2(p2, gc) > gr {
             let inward = unit2([gc[0] - p2[0], gc[1] - p2[1]]);
@@ -851,6 +890,13 @@ impl Brain {
         }
         self.mode = mode;
         let _ = my_scale;
+        if self.debug && self.ticks % 10 == 0 {
+            eprintln!(
+                "t={:.1} {:?} hp={:.0}/{:.0} e={:.0} pos=({:.0},{:.0},{:.0}) tgt={:?} enemies={} w=[{},{}] cubes={} zone=({:.0},{:.0} r{:.0}) mv=({:.2},{:.2}) fire={:?} retreat={}",
+                obs.t, mode, me.hp, max_hp, me.energy, pos[0], pos[1], pos[2], self.target_id, enemies.len(),
+                slot_kind(0), slot_kind(1), me.cubes, gc[0], gc[1], gr, act.mv[0], act.mv[1], act.fire, self.retreating
+            );
+        }
         if self.ticks % 5 == 0 {
             act.label = Some(format!("{:?} hp{:.0} t{}", mode, me.hp, self.target_id.unwrap_or(-1)));
         }
@@ -911,7 +957,7 @@ impl Brain {
                 } else {
                     fire[li] = true;
                 }
-            } else if lw.cooldown <= 0.05 && los && d < range && allow && !matches!(tg.kind, TargetKind::Crate) {
+            } else if lw.cooldown <= 0.05 && d < range && (los && allow || hiding) && !matches!(tg.kind, TargetKind::Crate) {
                 fire[li] = true;
                 aim = direct;
             }
