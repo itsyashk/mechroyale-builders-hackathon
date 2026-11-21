@@ -220,6 +220,10 @@ fn statf(me: &Me, k: &str, d: f32) -> f32 {
     me.stats.get(k).and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(d)
 }
 
+/// Changes only the bot's random choices (strafe timing etc.), not its strategy: lets the same
+/// strategy be measured on several independent draws.
+pub const SALT: u64 = 0;
+
 /// Strategy knobs. Defaults are the tuned values; MECHBOT_PARAMS="k=v,k=v" overrides
 /// them for local experiments.
 #[derive(Clone, Debug)]
@@ -567,7 +571,7 @@ impl Brain {
         })?;
         let nav = Nav::build(&world);
         let cfg = hello["config"].clone();
-        let seed = hello["seed"].as_u64().unwrap_or(12345) | 1;
+        let seed = (hello["seed"].as_u64().unwrap_or(12345) ^ SALT.wrapping_mul(0xA24BAED4963EE407)) | 1;
         Ok(Brain {
             world,
             nav,
