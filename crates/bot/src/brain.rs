@@ -113,6 +113,13 @@ pub struct Brain {
     allow_escape: bool,
     escape_goal: [f32; 2],
     last_ttd: f32,
+    sn_pair: Option<([f32; 2], [f32; 2])>,
+    sn_t: f32,
+    sn_tpos: [f32; 2],
+    sn_fire_t: f32,
+    sn_prev_charge: f32,
+    sn_active: bool,
+    sn_stat: [u32; 4],
     // config numbers
     pickup_radius: f32,
     cube_radius: f32,
@@ -177,6 +184,13 @@ pub struct Params {
     pub finish: f32,
     pub pick_until: f32,
     pub pick_aerr: f32,
+    /// Laser sniper: charge in cover, peek out to release, duck back during cooldown.
+    pub sniper: f32,
+    pub sn_min_d: f32,
+    pub sn_r: f32,
+    pub sn_stay: f32,
+    pub sn_loot: f32,
+    pub sn_others: f32,
 }
 
 impl Default for Params {
@@ -221,6 +235,12 @@ impl Default for Params {
             finish: 2.0,
             pick_until: 0.0,
             pick_aerr: 0.09,
+            sniper: 0.0,
+            sn_min_d: 45.0,
+            sn_r: 17.0,
+            sn_stay: 0.0,
+            sn_loot: 0.0,
+            sn_others: 40.0,
         }
     }
 }
@@ -273,6 +293,12 @@ impl Params {
                     "finish" => p.finish = x,
                     "pick_until" => p.pick_until = x,
                     "pick_aerr" => p.pick_aerr = x,
+                    "sniper" => p.sniper = x,
+                    "sn_min_d" => p.sn_min_d = x,
+                    "sn_r" => p.sn_r = x,
+                    "sn_stay" => p.sn_stay = x,
+                    "sn_loot" => p.sn_loot = x,
+                    "sn_others" => p.sn_others = x,
                     _ => eprintln!("unknown param {k}"),
                 }
             }
@@ -422,6 +448,13 @@ impl Brain {
             allow_escape: true,
             escape_goal: [0.0, 0.0],
             last_ttd: 0.0,
+            sn_pair: None,
+            sn_t: -100.0,
+            sn_tpos: [0.0, 0.0],
+            sn_fire_t: -100.0,
+            sn_prev_charge: 0.0,
+            sn_active: false,
+            sn_stat: [0; 4],
             debug: std::env::var("MECHBOT_DEBUG").is_ok(),
             gstat: [0; 7],
             debug_every: std::env::var("MECHBOT_DEBUG").ok().and_then(|v| v.parse().ok()).unwrap_or(10).max(1),
@@ -435,7 +468,7 @@ impl Brain {
     }
 
     pub fn log_end(&self, raw: &str) {
-        eprintln!("end: {raw} gunstat[mech_ticks,fire,nolos,range,ammo/reload,aim,hold]={:?}", self.gstat);
+        eprintln!("end: {raw} gunstat[mech_ticks,fire,nolos,range,ammo/reload,aim,hold]={:?} sniper[peek,hide,nopair,_]={:?}", self.gstat, self.sn_stat);
     }
 
     // ------------------------------------------------------------------ helpers --------
@@ -630,6 +663,61 @@ impl Brain {
             }
         }
         best.map(|b| b.1)
+    }
+
+    /// Sniper geometry: a (hide, peek) pair near us. `hide` is hidden from the target's eye,
+    /// `peek` has a muzzle line to the target's centre, and the two are a few metres apart so
+    /// we can step out to release a charged laser and step back during the cooldown.
+    #[allow(clippy::too_many_arguments)]
+    fn find_peek(&self, pos: V3, tpos: V3, tsc: f32, others: &[V3], circle: ([f32; 2], f32), muzzle_h: f32, my_scale: f32) -> Option<([f32; 2], [f32; 2])> {
+        let tc = [tpos[0], tpos[1], tpos[2] + 4.5 * tsc];
+        let teye = Self::eye_of(tpos, tsc);
+        let p2 = xy(pos);
+        let mut peeks: Vec<([f32; 2], f32)> = Vec::new();
+        let mut hides: Vec<([f32; 2], f32)> = Vec::new();
+        let rmax = self.prm.sn_r;
+        let rings = [0.0f32, 2.5, 5.0, 8.0, 12.0, 17.0, 23.0];
+        for (ri, &r) in rings.iter().enumerate() {
+            if r > rmax {
+                break;
+            }
+            let n = if r == 0.0 { 1 } else { 16 };
+            for k in 0..n {
+                let a = (k as f32 + 0.5 * (ri % 2) as f32) * 2.0 * PI / n as f32;
+                let c = [p2[0] + r * a.cos(), p2[1] + r * a.sin()];
+                if r > 0.0 && (!self.nav.walkable_at(c[0], c[1]) || self.nav.clearance_at(c[0], c[1]) < 2.0) {
+                    continue;
+                }
+                if dist2(c, circle.0) > circle.1 || dist2(c, xy(tpos)) < self.prm.sn_min_d * 0.7 {
+                    continue;
+                }
+                let g = if r == 0.0 { pos[2] } else { self.world.ground(c[0], c[1]) };
+                let mid = [c[0], c[1], g + 4.5 * my_scale];
+                let top = [c[0], c[1], g + 8.8 * my_scale];
+                let muz = [c[0], c[1], g + muzzle_h];
+                let n_others = others.iter().filter(|e| self.world.los(**e, mid)).count() as f32;
+                let pen = n_others * self.prm.sn_others;
+                if self.world.los(muz, tc) {
+                    peeks.push((c, r + pen));
+                } else if !self.world.los(teye, mid) && !self.world.los(teye, top) {
+                    hides.push((c, r + pen));
+                }
+            }
+        }
+        let mut best: Option<(f32, [f32; 2], [f32; 2])> = None;
+        for h in &hides {
+            for p in &peeks {
+                let dp = dist2(h.0, p.0);
+                if dp > 9.0 {
+                    continue;
+                }
+                let s = h.1 + p.1 * 0.5 + dp * 1.5;
+                if best.map(|b| s < b.0).unwrap_or(true) {
+                    best = Some((s, h.0, p.0));
+                }
+            }
+        }
+        best.map(|b| (b.1, b.2))
     }
 
     /// Direction to sidestep incoming projectiles, if any threaten us.
@@ -1026,11 +1114,11 @@ impl Brain {
                     continue;
                 }
                 let d = hdist(*pp, pos);
-                let reach = if slot_kind(1).is_empty() || slot_kind(0).is_empty() { 260.0 } else { 150.0 };
+                let reach = if slot_kind(1).is_empty() || slot_kind(0).is_empty() { 260.0 } else { 150.0 } + if kind == "laser" && !have_laser { self.prm.sn_loot } else { 0.0 };
                 if d > reach {
                     continue;
                 }
-                let s = d - gain * 25.0;
+                let s = d - gain * 25.0 - if kind == "laser" && !have_laser { self.prm.sn_loot } else { 0.0 };
                 if best_p.map(|b| s < b.0).unwrap_or(true) {
                     best_p = Some((s, *id, *pp));
                 }
@@ -1078,7 +1166,7 @@ impl Brain {
                     if let Some(c) = obs
                         .crates
                         .iter()
-                        .filter(|c| hdist(c.pos, pos) < self.prm.farm_range && dist2(xy(c.pos), gc) < gr)
+                        .filter(|c| hdist(c.pos, pos) < self.prm.farm_range + if have_laser { 0.0 } else { self.prm.sn_loot * 0.5 } && dist2(xy(c.pos), gc) < gr)
                         .min_by(|a, b| hdist(a.pos, pos).partial_cmp(&hdist(b.pos, pos)).unwrap())
                     {
                         mode = Mode::Farm;
@@ -1325,6 +1413,82 @@ impl Brain {
             }
         }
 
+        // Laser sniper: charge behind cover, step out when full to release, back in on cooldown.
+        self.sn_active = false;
+        let lz = me.weapons.iter().flatten().find(|w| w.kind == "laser").map(|w| (w.charge.unwrap_or(0.0), w.cooldown, w.stat("charge", 0.75), w.stat("range", 280.0)));
+        if let Some((ch, _, _, _)) = lz {
+            if self.sn_prev_charge > 0.0 && ch <= 0.0 {
+                self.sn_fire_t = obs.t;
+            }
+            self.sn_prev_charge = ch;
+        }
+        if self.prm.sniper > 0.0 && mode == Mode::Fight {
+            if let (Some((m, _)), Some((ch, cd, full, lrange))) = (&target_mech, lz) {
+                let d = hdist(m.pos, pos);
+                let tsc = 1.0 + 0.05 * m.cubes.unwrap_or(0) as f32;
+                if d > self.prm.sn_min_d && d < lrange * 0.9 {
+                    let teye = Self::eye_of(m.pos, tsc);
+                    let others: Vec<V3> = threat_eyes.iter().copied().filter(|e| ((e[0] - teye[0]).powi(2) + (e[1] - teye[1]).powi(2)).sqrt() > 1.0).collect();
+                    if obs.t - self.sn_t > 0.4 || dist2(self.sn_tpos, xy(m.pos)) > 6.0 || self.sn_pair.is_none() && obs.t - self.sn_t > 0.2 {
+                        self.sn_t = obs.t;
+                        self.sn_tpos = xy(m.pos);
+                        self.sn_pair = self.find_peek(pos, m.pos, tsc, &others, (gc, gr), muzzle_h, my_scale);
+                    }
+                    if let Some((hide, peek)) = self.sn_pair {
+                        self.sn_active = true;
+                        let charging = ch > 0.0;
+                        let half = walk * 0.5;
+                        let walk_t = dist2(p2, peek) / half.max(1.0);
+                        let staying = self.prm.sn_stay > 0.0 && obs.t - self.sn_fire_t < self.prm.sn_stay;
+                        let go_peek = (charging && ch >= full - walk_t - 0.05) || staying;
+                        let g = if go_peek { peek } else { hide };
+                        let _ = cd;
+                        if go_peek {
+                            self.sn_stat[0] += 1;
+                        } else {
+                            self.sn_stat[1] += 1;
+                        }
+                        mv = if dist2(g, p2) > 0.7 { self.goto(p2, g) } else { [0.0, 0.0] };
+                        want_boost = !charging && dist2(g, p2) > 4.0;
+                    } else {
+                        self.sn_stat[2] += 1;
+                    }
+                }
+            }
+        }
+
+        // Laser magnet: a laser on the ground nearby is worth breaking off for, even mid-fight.
+        if self.prm.sn_loot > 0.0 && !have_laser && !self.retreating && !zone_urgent && matches!(mode, Mode::Fight | Mode::Cover | Mode::Farm | Mode::Hold | Mode::Roam) {
+            let near = self
+                .pickups
+                .iter()
+                .filter(|(id, (k, pp, _))| k == "laser" && !self.bad_pickups.contains_key(id) && dist2(xy(*pp), gc) < gr && (pp[2] - pos[2]).abs() < 6.0)
+                .map(|(id, (_, pp, _))| (*id, *pp, hdist(*pp, pos)))
+                .filter(|x| x.2 < self.prm.sn_loot * if mode == Mode::Fight || mode == Mode::Cover { 0.5 } else { 1.0 })
+                .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
+            if let Some((id, pp, d)) = near {
+                mv = self.goto(p2, xy(pp));
+                want_boost = d > 8.0;
+                if mode == Mode::Farm {
+                    aux_target = None;
+                }
+                if d < self.pickup_radius - 0.6 && (pp[2] - pos[2]).abs() < 3.8 {
+                    let drop = if slot_kind(0).is_empty() || slot_kind(1).is_empty() {
+                        None
+                    } else if slot_kind(0) == "gun" {
+                        Some(1)
+                    } else if slot_kind(1) == "gun" {
+                        Some(0)
+                    } else if self.prm.prio(slot_kind(0)) <= self.prm.prio(slot_kind(1)) {
+                        Some(0)
+                    } else {
+                        Some(1)
+                    };
+                    take = Some((id, drop));
+                }
+            }
+        }
+
         if mode == Mode::Farm {
             if let Some(a) = aux_target {
                 let d = hdist(a.pos, pos);
@@ -1477,7 +1641,7 @@ impl Brain {
         let mut aim: Option<[f32; 2]> = None;
         let mut fire = [false, false];
         if let Some(tg) = tgt {
-            let (a, f) = self.weapons_on(obs, tg, muzzle, mode == Mode::Cover);
+            let (a, f) = self.weapons_on(obs, tg, muzzle, mode == Mode::Cover, self.sn_active);
             aim = Some(a);
             fire = f;
         }
@@ -1580,7 +1744,7 @@ impl Brain {
     }
 
     /// Aim and trigger decisions for both slots against a target.
-    fn weapons_on(&mut self, obs: &Obs, tg: Target, muzzle: V3, hiding: bool) -> ([f32; 2], [bool; 2]) {
+    fn weapons_on(&mut self, obs: &Obs, tg: Target, muzzle: V3, hiding: bool, snipe: bool) -> ([f32; 2], [bool; 2]) {
         let me = &obs.me;
         let pos = me.pos;
         let (center_h, radius) = match tg.kind {
@@ -1633,7 +1797,7 @@ impl Brain {
                 } else {
                     fire[li] = true;
                 }
-            } else if lw.cooldown <= 0.05 && d < range && (los && allow || hiding) && !matches!(tg.kind, TargetKind::Crate) {
+            } else if lw.cooldown <= 0.05 && d < range && (los && allow || hiding || snipe) && !matches!(tg.kind, TargetKind::Crate) {
                 fire[li] = true;
                 aim = direct;
             }
