@@ -301,6 +301,8 @@ pub struct Params {
     pub mclus: f32,
     /// Target-score bonus (m) for mortar carriers while we hold a laser (cook-off).
     pub lcook: f32,
+    /// 1 = never retreat (full berserk).
+    pub noret: f32,
     /// Remember out-of-view enemies for this many s (cover choice, threat estimate).
     pub memt: f32,
     pub nlr: f32,
@@ -374,6 +376,7 @@ impl Default for Params {
             lhold: 0.0,
             mclus: 0.0,
             lcook: 0.0,
+            noret: 1.0,
             memt: 0.0,
             nlr: 2.0,
             nlr_t: 90.0,
@@ -454,6 +457,7 @@ impl Params {
                     "lhold" => p.lhold = x,
                     "mclus" => p.mclus = x,
                     "lcook" => p.lcook = x,
+                    "noret" => p.noret = x,
                     "memt" => p.memt = x,
                     "nlr" => p.nlr = x,
                     "nlr_t" => p.nlr_t = x,
@@ -1488,7 +1492,7 @@ impl Brain {
             let losing = ttk > ttd * self.prm.retreat_ratio && ttk > 2.5 && (hp_frac < self.prm.retreat_hp || n_shooting >= 2);
             let low = hp_frac < 0.3 && tgt_hp > me.hp * 0.5;
             let pinned = self.prm.corner_d > 0.0 && tgt_d < self.prm.corner_d && n_shooting <= 1;
-            if (losing || low) && !pinned {
+            if (losing || low) && !pinned && self.prm.noret < 0.5 {
                 self.retreating = true;
                 self.cover_goal = None;
             }
