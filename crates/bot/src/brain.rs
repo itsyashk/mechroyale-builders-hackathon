@@ -222,7 +222,7 @@ fn statf(me: &Me, k: &str, d: f32) -> f32 {
 
 /// Changes only the bot's random choices (strafe timing etc.), not its strategy: lets the same
 /// strategy be measured on several independent draws.
-pub const SALT: u64 = 0;
+pub const SALT: u64 = 2;
 
 /// Strategy knobs. Defaults are the tuned values; MECHBOT_PARAMS="k=v,k=v" overrides
 /// them for local experiments.
