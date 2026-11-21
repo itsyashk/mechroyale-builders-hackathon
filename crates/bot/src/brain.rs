@@ -192,6 +192,8 @@ pub struct Params {
     pub sn_loot: f32,
     pub sn_others: f32,
     pub sn_cover: f32,
+    pub sn_hyst: f32,
+    pub sn_maxp: f32,
 }
 
 impl Default for Params {
@@ -243,6 +245,8 @@ impl Default for Params {
             sn_loot: 0.0,
             sn_others: 40.0,
             sn_cover: 0.0,
+            sn_hyst: 0.0,
+            sn_maxp: 9.0,
         }
     }
 }
@@ -302,6 +306,8 @@ impl Params {
                     "sn_loot" => p.sn_loot = x,
                     "sn_others" => p.sn_others = x,
                     "sn_cover" => p.sn_cover = x,
+                    "sn_hyst" => p.sn_hyst = x,
+                    "sn_maxp" => p.sn_maxp = x,
                     _ => eprintln!("unknown param {k}"),
                 }
             }
@@ -680,6 +686,7 @@ impl Brain {
         let mut hides: Vec<([f32; 2], f32)> = Vec::new();
         let rmax = self.prm.sn_r;
         let rings = [0.0f32, 2.5, 5.0, 8.0, 12.0, 17.0, 23.0];
+        let mut cands: Vec<([f32; 2], f32)> = Vec::new();
         for (ri, &r) in rings.iter().enumerate() {
             if r > rmax {
                 break;
@@ -687,8 +694,19 @@ impl Brain {
             let n = if r == 0.0 { 1 } else { 16 };
             for k in 0..n {
                 let a = (k as f32 + 0.5 * (ri % 2) as f32) * 2.0 * PI / n as f32;
-                let c = [p2[0] + r * a.cos(), p2[1] + r * a.sin()];
-                if r > 0.0 && (!self.nav.walkable_at(c[0], c[1]) || self.nav.clearance_at(c[0], c[1]) < 2.0) {
+                cands.push(([p2[0] + r * a.cos(), p2[1] + r * a.sin()], r));
+            }
+        }
+        // Hysteresis: re-offer the current pair at a discount so we don't flip between spots.
+        if self.prm.sn_hyst > 0.0 {
+            if let Some((h, p)) = self.sn_pair {
+                cands.push((h, dist2(h, p2) - self.prm.sn_hyst));
+                cands.push((p, dist2(p, p2) - self.prm.sn_hyst));
+            }
+        }
+        {
+            for &(c, r) in &cands {
+                if r != 0.0 && (!self.nav.walkable_at(c[0], c[1]) || self.nav.clearance_at(c[0], c[1]) < 2.0) {
                     continue;
                 }
                 if dist2(c, circle.0) > circle.1 || dist2(c, xy(tpos)) < self.prm.sn_min_d * 0.7 {
@@ -711,7 +729,7 @@ impl Brain {
         for h in &hides {
             for p in &peeks {
                 let dp = dist2(h.0, p.0);
-                if dp > 9.0 {
+                if dp > self.prm.sn_maxp {
                     continue;
                 }
                 let s = h.1 + p.1 * 0.5 + dp * 1.5;
