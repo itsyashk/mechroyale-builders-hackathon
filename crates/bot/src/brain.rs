@@ -100,7 +100,9 @@ pub struct Brain {
     dodge_check_t: f32,
     dodges: u32,
     last_ttk: f32,
+    prm: Params,
     escape_until: f32,
+    allow_escape: bool,
     escape_goal: [f32; 2],
     last_ttd: f32,
     // config numbers
@@ -124,13 +126,94 @@ fn statf(me: &Me, k: &str, d: f32) -> f32 {
     me.stats.get(k).and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(d)
 }
 
-fn weapon_prio(kind: &str) -> f32 {
-    match kind {
-        "laser" => 4.0,
-        "lightning" => 3.0,
-        "gun" => 2.0,
-        "mortar" => 1.5,
-        _ => 0.0,
+/// Strategy knobs. Defaults are the tuned values; MECHBOT_PARAMS="k=v,k=v" overrides
+/// them for local experiments.
+#[derive(Clone, Debug)]
+pub struct Params {
+    pub p_laser: f32,
+    pub p_light: f32,
+    pub p_gun: f32,
+    pub p_mortar: f32,
+    pub light_lo: f32,
+    pub light_hi: f32,
+    pub laser_lo: f32,
+    pub laser_hi: f32,
+    pub gun_lo: f32,
+    pub gun_hi: f32,
+    pub vs_light_lo: f32,
+    pub retreat_ratio: f32,
+    pub retreat_hp: f32,
+    pub farm_hp: f32,
+    pub farm_range: f32,
+    pub engage_all: f32,
+    pub drops: f32,
+}
+
+impl Default for Params {
+    fn default() -> Self {
+        Params {
+            p_laser: 4.0,
+            p_light: 3.0,
+            p_gun: 2.0,
+            p_mortar: 1.5,
+            light_lo: 10.0,
+            light_hi: 32.0,
+            laser_lo: 45.0,
+            laser_hi: 140.0,
+            gun_lo: 18.0,
+            gun_hi: 55.0,
+            vs_light_lo: 56.0,
+            retreat_ratio: 0.85,
+            retreat_hp: 0.6,
+            farm_hp: 0.6,
+            farm_range: 70.0,
+            engage_all: 1.0,
+            drops: 1.0,
+        }
+    }
+}
+
+impl Params {
+    pub fn from_env() -> Params {
+        let mut p = Params::default();
+        if let Ok(v) = std::env::var("MECHBOT_PARAMS") {
+            for kv in v.split(',') {
+                let mut it = kv.splitn(2, '=');
+                let (k, val) = (it.next().unwrap_or("").trim(), it.next().and_then(|x| x.trim().parse::<f32>().ok()));
+                let Some(x) = val else { continue };
+                match k {
+                    "p_laser" => p.p_laser = x,
+                    "p_light" => p.p_light = x,
+                    "p_gun" => p.p_gun = x,
+                    "p_mortar" => p.p_mortar = x,
+                    "light_lo" => p.light_lo = x,
+                    "light_hi" => p.light_hi = x,
+                    "laser_lo" => p.laser_lo = x,
+                    "laser_hi" => p.laser_hi = x,
+                    "gun_lo" => p.gun_lo = x,
+                    "gun_hi" => p.gun_hi = x,
+                    "vs_light_lo" => p.vs_light_lo = x,
+                    "retreat_ratio" => p.retreat_ratio = x,
+                    "retreat_hp" => p.retreat_hp = x,
+                    "farm_hp" => p.farm_hp = x,
+                    "farm_range" => p.farm_range = x,
+                    "engage_all" => p.engage_all = x,
+                    "drops" => p.drops = x,
+                    _ => eprintln!("unknown param {k}"),
+                }
+            }
+        }
+        p
+    }
+
+    fn prio(&self, kind: &str) -> f32 {
+        match kind {
+            "laser" => self.p_laser,
+            "lightning" => self.p_light,
+            "gun" => self.p_gun,
+            "mortar" => self.p_mortar,
+            _ => 0.0,
+        }
     }
 }
 
@@ -204,7 +287,9 @@ impl Brain {
             dodge_check_t: -1.0,
             dodges: 0,
             last_ttk: 0.0,
+            prm: Params::from_env(),
             escape_until: -1.0,
+            allow_escape: true,
             escape_goal: [0.0, 0.0],
             last_ttd: 0.0,
             debug: std::env::var("MECHBOT_DEBUG").is_ok(),
@@ -272,7 +357,7 @@ impl Brain {
             self.path_t = self.t;
             // Unreachable on foot (walled pocket, roof): jet straight over toward the goal.
             let end = self.path.last().copied().unwrap_or(pos);
-            if dist2(end, goal) > 10.0 && dist2(pos, goal) > 10.0 && dist2(end, pos) < 12.0 {
+            if self.allow_escape && dist2(end, goal) > 10.0 && dist2(pos, goal) > 10.0 && dist2(end, pos) < 12.0 {
                 self.escape_until = self.t + 2.5;
                 self.escape_goal = goal;
             }
@@ -524,6 +609,9 @@ impl Brain {
         // ---- enemies
         let enemies: Vec<&Mech> = obs.mechs.iter().filter(|m| m.is_mech() && m.id != me.id).collect();
         let attackers: Vec<i64> = self.dmg_log.iter().filter(|d| obs.t - d.0 < 3.0).filter_map(|d| d.2).collect();
+        let dmg_by = |id: i64, log: &Vec<(f32, f32, Option<i64>, f32)>| -> f32 {
+            log.iter().filter(|d| obs.t - d.0 < 2.0 && d.2 == Some(id)).map(|d| d.3).sum()
+        };
         let mut best_t: Option<(f32, &Mech, bool)> = None;
         for m in &enemies {
             let scale = 1.0 + 0.05 * m.cubes.unwrap_or(0) as f32;
@@ -537,6 +625,8 @@ impl Brain {
             if attackers.contains(&m.id) {
                 s -= 50.0;
             }
+            // Whoever is hurting us most right now gets our front armour and our guns.
+            s -= dmg_by(m.id, &self.dmg_log) * 0.25;
             if Some(m.id) == self.target_id {
                 s -= 30.0;
             }
@@ -547,6 +637,10 @@ impl Brain {
         let target_mech = best_t.map(|b| (b.1.clone(), b.2));
         self.target_id = target_mech.as_ref().map(|t| t.0.id);
 
+        self.allow_escape = enemies.is_empty() && obs.t - self.last_dmg_t > 3.0;
+        if !self.allow_escape {
+            self.escape_until = -1.0;
+        }
         let threat_eyes: Vec<V3> = enemies
             .iter()
             .filter(|m| hdist(m.pos, pos) < 260.0)
@@ -614,7 +708,7 @@ impl Brain {
                 self.retreating = false;
             }
         } else if target_mech.is_some() {
-            let losing = ttk > ttd * 0.85 && ttk > 2.5 && (hp_frac < 0.6 || n_shooting >= 2);
+            let losing = ttk > ttd * self.prm.retreat_ratio && ttk > 2.5 && (hp_frac < self.prm.retreat_hp || n_shooting >= 2);
             let low = hp_frac < 0.3 && tgt_hp > me.hp * 0.5;
             if losing || low {
                 self.retreating = true;
@@ -650,7 +744,7 @@ impl Brain {
             mode = Mode::Zone;
             goal = Some(Self::clamp_into(p2, gc, gr * 0.7));
             want_boost = !me.in_zone;
-        } else if target_mech.is_some() && (self.retreating || sniper) {
+        } else if target_mech.is_some() && (self.retreating || sniper || self.prm.engage_all < 0.5 && _avoid) {
             mode = Mode::Cover;
         } else if target_mech.is_some() {
             mode = Mode::Fight;
@@ -662,8 +756,8 @@ impl Brain {
         if matches!(mode, Mode::Roam) {
             // Weapon pickups.
             let worst_slot = {
-                let k0 = weapon_prio(slot_kind(0));
-                let k1 = weapon_prio(slot_kind(1));
+                let k0 = self.prm.prio(slot_kind(0));
+                let k1 = self.prm.prio(slot_kind(1));
                 if slot_kind(1).is_empty() {
                     (1usize, 0.0)
                 } else if slot_kind(0).is_empty() {
@@ -679,7 +773,7 @@ impl Brain {
                 if self.bad_pickups.contains_key(id) || has(kind) {
                     continue;
                 }
-                let pr = weapon_prio(kind);
+                let pr = self.prm.prio(kind);
                 // Keep the gun unless we would hold two specials (laser + lightning).
                 let gain = pr - worst_slot.1;
                 if gain <= 0.0 {
@@ -723,7 +817,7 @@ impl Brain {
                 }
             }
             // Supply drops.
-            if mode == Mode::Roam && hp_frac > 0.3 {
+            if mode == Mode::Roam && hp_frac > 0.3 && self.prm.drops > 0.5 {
                 for d in &obs.drops {
                     let dd = hdist(d.pos, pos);
                     let eta = dd / (walk * 1.2);
@@ -744,13 +838,13 @@ impl Brain {
                     if let Some(c) = obs
                         .crates
                         .iter()
-                        .filter(|c| hdist(c.pos, pos) < 70.0 && dist2(xy(c.pos), gc) < gr)
+                        .filter(|c| hdist(c.pos, pos) < self.prm.farm_range && dist2(xy(c.pos), gc) < gr)
                         .min_by(|a, b| hdist(a.pos, pos).partial_cmp(&hdist(b.pos, pos)).unwrap())
                     {
                         mode = Mode::Farm;
                         aux_target = Some(Target { id: c.id, pos: c.pos, vel: [0.0; 3], kind: TargetKind::Crate, scale: 1.0 });
                         goal = Some(xy(c.pos));
-                    } else if hp_frac > 0.6 {
+                    } else if hp_frac > self.prm.farm_hp {
                         if let Some(n) = obs
                             .mechs
                             .iter()
@@ -829,17 +923,17 @@ impl Brain {
             if let Some((m, shootable)) = &target_mech {
                 let d = hdist(m.pos, pos);
                 let (lo, hi) = if have_light {
-                    (10.0, 32.0)
+                    (self.prm.light_lo, self.prm.light_hi)
                 } else if have_laser {
                     if m.has("lightning") {
-                        (55.0, 150.0)
+                        (self.prm.laser_lo + 10.0, self.prm.laser_hi + 10.0)
                     } else {
-                        (45.0, 140.0)
+                        (self.prm.laser_lo, self.prm.laser_hi)
                     }
                 } else if m.has("lightning") {
-                    (56.0, 95.0)
+                    (self.prm.vs_light_lo, self.prm.vs_light_lo + 40.0)
                 } else {
-                    (18.0, 55.0)
+                    (self.prm.gun_lo, self.prm.gun_hi)
                 };
                 if !shootable {
                     // Go find a line on it (or wait at a corner when it is a sniper).
