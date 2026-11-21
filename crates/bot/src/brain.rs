@@ -84,6 +84,10 @@ enum Mode {
     Drop,
     Roam,
     Hold,
+    /// Survivor: sit still in a hidden spot.
+    Hide,
+    /// Survivor: spotted / enemy close -> break line of sight while shooting back.
+    Flee,
 }
 
 #[derive(Clone, Copy)]
@@ -158,6 +162,13 @@ pub struct Brain {
     juke_dir: [f32; 2],
     juke_src: i64,
     akl_prev: [f32; 2],
+    kills: i32,
+    surv_spot: Option<[f32; 2]>,
+    surv_eval_t: f32,
+    flee_goal: Option<[f32; 2]>,
+    flee_t: f32,
+    surv_fight_until: f32,
+    loud: Vec<(f32, [f32; 2])>,
     // config numbers
     pickup_radius: f32,
     cube_radius: f32,
@@ -244,6 +255,18 @@ pub struct Params {
     pub mlz: f32,
     pub lj_t0: f32,
     pub lj_len: f32,
+    /// Survivor mode: after `surv_k` kills or `surv_t` seconds, stop starting fights and hide
+    /// inside the next zone circle out of sight of known enemies; break LOS when spotted.
+    pub surv: f32,
+    pub surv_k: f32,
+    pub surv_t: f32,
+    /// Enemy this close (m) counts as a threat even without LOS (proximity sensors are 45 m).
+    pub surv_d: f32,
+    /// Cornered: enemy this close and no hidden cell -> fight it out.
+    pub surv_c: f32,
+    /// Hide-spot search radius (m) and samples.
+    pub surv_sr: f32,
+    pub surv_n: f32,
 }
 
 impl Default for Params {
@@ -304,6 +327,13 @@ impl Default for Params {
             mlz: 1.0,
             lj_t0: 0.15,
             lj_len: 0.6,
+            surv: 0.0,
+            surv_k: 3.0,
+            surv_t: 90.0,
+            surv_d: 45.0,
+            surv_c: 30.0,
+            surv_sr: 60.0,
+            surv_n: 90.0,
         }
     }
 }
@@ -372,6 +402,13 @@ impl Params {
                     "mlz" => p.mlz = x,
                     "lj_t0" => p.lj_t0 = x,
                     "lj_len" => p.lj_len = x,
+                    "surv" => p.surv = x,
+                    "surv_k" => p.surv_k = x,
+                    "surv_t" => p.surv_t = x,
+                    "surv_d" => p.surv_d = x,
+                    "surv_c" => p.surv_c = x,
+                    "surv_sr" => p.surv_sr = x,
+                    "surv_n" => p.surv_n = x,
                     _ => eprintln!("unknown param {k}"),
                 }
             }
@@ -533,6 +570,13 @@ impl Brain {
             juke_dir: [0.0, 0.0],
             juke_src: -1,
             akl_prev: [0.0, 0.0],
+            kills: 0,
+            surv_spot: None,
+            surv_eval_t: -100.0,
+            flee_goal: None,
+            flee_t: -100.0,
+            surv_fight_until: -1.0,
+            loud: Vec::new(),
             duel_on: std::env::var("MECHBOT_DUEL").is_ok(),
             debug: std::env::var("MECHBOT_DEBUG").is_ok(),
             gstat: [0; 7],
@@ -815,7 +859,66 @@ impl Brain {
         self.hold_spot = best.map(|b| (b.1, b.2));
     }
 
-    fn find_cover(&mut self, pos: V3, threats: &[V3], circle: ([f32; 2], f32), away_from: Option<[f32; 2]>, max_r: f32) -> Option<[f32; 2]> {
+    /// Survivor hide spot: walkable, inside `hide` (next zone circle) and `cur` (current zone),
+    /// out of sight of every threat eye, enclosed, far from threats, not too far to walk.
+    /// The current spot is re-scored with a bonus (hysteresis).
+    fn pick_surv_spot(&mut self, pos: [f32; 2], hide: ([f32; 2], f32), cur: ([f32; 2], f32), threats: &[V3]) {
+        let (hc, hr) = hide;
+        let ok = |c: [f32; 2]| dist2(c, hc) <= hr && dist2(c, cur.0) <= (cur.1 - 6.0).max(2.0);
+        // Cheap part (exposure, distances) for every candidate; enclosure only for the best few.
+        let score = |me: &Self, c: [f32; 2]| -> f32 {
+            let g = me.world.ground(c[0], c[1]);
+            let mid = [c[0], c[1], g + 4.5];
+            let top = [c[0], c[1], g + 8.8];
+            let mut s = 0.0;
+            let mut nearest = 400.0f32;
+            for e in threats {
+                let d = dist2(c, xy(*e));
+                nearest = nearest.min(d);
+                if d < 260.0 && (me.world.los(*e, mid) || me.world.los(*e, top)) {
+                    s -= 60.0 + (260.0 - d) * 0.3;
+                }
+            }
+            s += nearest.min(150.0) * 0.35;
+            s -= dist2(c, pos) * 0.25;
+            s
+        };
+        let mut cands: Vec<(f32, [f32; 2], f32)> = Vec::new();
+        if let Some(sp) = self.surv_spot {
+            if ok(sp) {
+                cands.push((score(self, sp), sp, 25.0));
+            }
+        }
+        // Anchor the search on the part of the hide circle nearest us.
+        let anchor = if dist2(pos, hc) < hr * 0.9 { pos } else { Self::clamp_into(pos, hc, hr * 0.85) };
+        let r = self.prm.surv_sr.min(hr.max(4.0));
+        let n = self.prm.surv_n as usize;
+        for i in 0..n {
+            let c = if i == 0 {
+                anchor
+            } else {
+                let a = self.rng.f() * 2.0 * PI;
+                let rr = r * self.rng.f().sqrt();
+                [anchor[0] + rr * a.cos(), anchor[1] + rr * a.sin()]
+            };
+            if !ok(c) || !self.nav.walkable_at(c[0], c[1]) || self.nav.clearance_at(c[0], c[1]) < 3.0 {
+                continue;
+            }
+            let sc = score(self, c);
+            cands.push((sc, c, 0.0));
+        }
+        cands.sort_by(|a, b| (b.0 + b.2).partial_cmp(&(a.0 + a.2)).unwrap());
+        let mut best: Option<(f32, [f32; 2])> = None;
+        for (sc, c, bonus) in cands.into_iter().take(10) {
+            let s = sc + bonus + self.nook_score(c) * 6.0;
+            if best.map(|b| s > b.0).unwrap_or(true) {
+                best = Some((s, c));
+            }
+        }
+        self.surv_spot = best.map(|b| b.1).or(Some(anchor));
+    }
+
+    fn find_cover(&mut self,pos: V3, threats: &[V3], circle: ([f32; 2], f32), away_from: Option<[f32; 2]>, max_r: f32) -> Option<[f32; 2]> {
         let mut best: Option<(f32, [f32; 2])> = None;
         let rings = [5.0f32, 9.0, 14.0, 20.0, 28.0, 38.0];
         let n_dir = 20;
@@ -1028,6 +1131,9 @@ impl Brain {
 
         // ---- memory updates
         for e in &obs.events {
+            if e.kind == "kill" {
+                self.kills += 1;
+            }
             match e.kind.as_str() {
                 "damaged" => {
                     self.last_dmg_t = obs.t;
@@ -1052,6 +1158,19 @@ impl Brain {
             }
         }
         self.dmg_log.retain(|d| obs.t - d.0 < 6.0);
+        for snd in &obs.sounds {
+            let r = match snd.dist.as_str() {
+                "near" => 35.0,
+                "mid" => 105.0,
+                _ => 220.0,
+            };
+            self.loud.push((obs.t - snd.age, [pos[0] + r * snd.bearing.cos(), pos[1] + r * snd.bearing.sin()]));
+        }
+        self.loud.retain(|l| obs.t - l.0 < 12.0);
+        if self.loud.len() > 48 {
+            let n = self.loud.len() - 48;
+            self.loud.drain(0..n);
+        }
         for m in obs.mechs.iter().filter(|m| m.is_mech() && m.id != me.id) {
             let first_t = self.tracks.get(&m.id).map(|t| t.first_t).unwrap_or(obs.t);
             let charge_t0 = self.tracks.get(&m.id).filter(|t| t.charging && t.charge_t0 >= 0.0 && obs.t - t.seen_t < 0.3).map(|t| t.charge_t0).unwrap_or(obs.t);
@@ -1443,6 +1562,103 @@ impl Brain {
             }
         }
 
+        // ---- survivor mode: stop starting fights, hide inside the next circle, break LOS when spotted.
+        let surv_on = self.prm.surv > 0.5 && (self.kills as f32 >= self.prm.surv_k || obs.t >= self.prm.surv_t);
+        if surv_on && mode != Mode::Zone {
+            let me_top = [pos[0], pos[1], pos[2] + 8.8 * my_scale];
+            let mut nearest: Option<(f32, [f32; 2])> = None;
+            let mut seen = false;
+            for m in &enemies {
+                let d = hdist(m.pos, pos);
+                let e = Self::eye_of(m.pos, 1.0 + 0.05 * m.cubes.unwrap_or(0) as f32);
+                if d < 220.0 && (self.world.los(e, me_c) || self.world.los(e, me_top)) {
+                    seen = true;
+                }
+                if nearest.map(|n| d < n.0).unwrap_or(true) {
+                    nearest = Some((d, xy(m.pos)));
+                }
+            }
+            let near_d = nearest.map(|n| n.0).unwrap_or(999.0);
+            let mech_hit = self.dmg_log.iter().any(|d| obs.t - d.0 < 1.5 && d.2.map(|b| b < 100).unwrap_or(true));
+            // An enemy close by without a line on us is handled by the hide-spot search (it is in
+            // the threat list, so we slip away from it quietly); flee only when actually seen.
+            let threatened = seen || mech_hit && !enemies.is_empty() && near_d < 200.0;
+            if threatened {
+                if obs.t - self.flee_t > 0.5 || self.flee_goal.map(|g| dist2(g, p2) < 1.5).unwrap_or(true) {
+                    self.flee_t = obs.t;
+                    self.flee_goal = self.find_cover(pos, &threat_eyes, (gc, gr), nearest.map(|n| n.1), 40.0);
+                }
+                let cornered = near_d < self.prm.surv_c && self.flee_goal.is_none();
+                if cornered {
+                    self.surv_fight_until = obs.t + 2.0;
+                }
+                if (cornered || obs.t < self.surv_fight_until && near_d < self.prm.surv_c + 10.0) && target_mech.is_some() {
+                    mode = Mode::Fight;
+                } else {
+                    mode = Mode::Flee;
+                    goal = self.flee_goal.or_else(|| {
+                        nearest.map(|n| {
+                            let away = unit2([p2[0] - n.1[0], p2[1] - n.1[1]]);
+                            Self::clamp_into([p2[0] + away[0] * 25.0, p2[1] + away[1] * 25.0], gc, gr * 0.9)
+                        })
+                    });
+                    if goal.is_none() {
+                        mode = Mode::Hide;
+                    }
+                }
+                if mode != Mode::Fight && aux_target.map(|a| !matches!(a.kind, TargetKind::Npc)).unwrap_or(false) {
+                    aux_target = None;
+                }
+                take = None;
+            }
+            if !threatened || mode == Mode::Hide {
+                self.flee_goal = None;
+                let quiet = !self.tracks.values().any(|t| obs.t - t.seen_t < 5.0);
+                // Loot only when very close and safe.
+                let keep_loot = mode == Mode::Loot && quiet && goal.map(|g| dist2(g, p2) < 20.0).unwrap_or(false);
+                if !keep_loot {
+                    take = None;
+                    let cube = obs
+                        .cubes
+                        .iter()
+                        .filter(|c| quiet && hdist(c.pos, pos) < 20.0 && (c.pos[2] - pos[2]).abs() < 4.0 && dist2(xy(c.pos), gc) < gr)
+                        .min_by(|a, b| hdist(a.pos, pos).partial_cmp(&hdist(b.pos, pos)).unwrap());
+                    if let Some(c) = cube {
+                        mode = Mode::Loot;
+                        goal = Some(xy(c.pos));
+                    } else {
+                        let z = &obs.zone;
+                        let (cc, cr) = Self::zone_now(z, obs.t);
+                        let nr = z.next_radius;
+                        let hide = (z.next_center, (nr - (nr * 0.2).max(6.0)).max(4.0));
+                        let every = if near_d < self.prm.surv_d { 0.3 } else { 1.0 };
+                        if obs.t - self.surv_eval_t > every || self.surv_spot.is_none() {
+                            self.surv_eval_t = obs.t;
+                            let mut thr: Vec<(f32, V3)> = self
+                                .tracks
+                                .values()
+                                .map(|t| (hdist(t.pos, pos), Self::eye_of(t.pos, 1.0 + 0.05 * t.cubes as f32)))
+                                .collect();
+                            for l in &self.loud {
+                                let g = self.world.ground(l.1[0], l.1[1]);
+                                thr.push((dist2(l.1, p2) + 40.0, [l.1[0], l.1[1], g + 8.0]));
+                            }
+                            thr.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                            let thr: Vec<V3> = thr.into_iter().take(8).map(|x| x.1).collect();
+                            self.pick_surv_spot(p2, hide, (cc, cr), &thr);
+                        }
+                        mode = Mode::Hide;
+                        goal = self.surv_spot;
+                    }
+                }
+                // Only shoot NPCs that are attacking us; never farm.
+                let npc_attack = self.dmg_log.iter().any(|d| obs.t - d.0 < 2.0 && d.2.map(|b| b >= 100).unwrap_or(false));
+                if !npc_attack {
+                    aux_target = None;
+                }
+            }
+        }
+
         // ---- movement per mode
         let tgt: Option<Target> = target_mech
             .as_ref()
@@ -1455,6 +1671,19 @@ impl Brain {
         }
 
         match mode {
+            Mode::Hide => {
+                if let Some(g) = goal {
+                    mv = if dist2(g, p2) > 1.5 { self.goto(p2, g) } else { [0.0, 0.0] };
+                    // Quiet: no boost unless the spot is far away.
+                    want_boost = dist2(g, p2) > 90.0;
+                }
+            }
+            Mode::Flee => {
+                if let Some(g) = goal {
+                    mv = if dist2(g, p2) > 1.0 { self.goto(p2, g) } else { [0.0, 0.0] };
+                    want_boost = dist2(g, p2) > 3.0;
+                }
+            }
             Mode::Hold => {
                 if let Some(g) = goal {
                     mv = if dist2(g, p2) > 2.0 { self.goto(p2, g) } else { [0.0, 0.0] };
@@ -1766,7 +1995,7 @@ impl Brain {
         }
 
         // Laser dodge: an enemy charging at us with a clear line -> duck into nearby cover.
-        if matches!(mode, Mode::Fight | Mode::Farm | Mode::Roam | Mode::Loot | Mode::Hold) {
+        if matches!(mode, Mode::Fight | Mode::Farm | Mode::Roam | Mode::Loot | Mode::Hold | Mode::Hide | Mode::Flee) {
             let me_c = [pos[0], pos[1], pos[2] + 4.5 * my_scale];
             let charger = enemies
                 .iter()
@@ -1796,7 +2025,7 @@ impl Brain {
         // Anti-lightning kite: an arc thrower inside ~50 m out-damages anything we carry and
         // follows us into cover, so back-pedal (torso keeps shooting) to stay out of its range.
         let mut kiting = false;
-        if self.prm.akl > 0.0 && matches!(mode, Mode::Fight | Mode::Cover | Mode::Farm | Mode::Loot | Mode::Roam | Mode::Hold) && (!have_light || self.prm.akl_own > 0.5) {
+        if self.prm.akl > 0.0 && matches!(mode, Mode::Fight | Mode::Cover | Mode::Farm | Mode::Loot | Mode::Roam | Mode::Hold | Mode::Flee | Mode::Hide) && (!have_light || self.prm.akl_own > 0.5) {
             let zappers: Vec<[f32; 2]> = enemies
                 .iter()
                 .filter(|m| m.has("lightning") && hdist(m.pos, pos) < self.prm.akl && (m.pos[2] - pos[2]).abs() < 12.0)
@@ -1841,8 +2070,8 @@ impl Brain {
                     want_boost = true;
                     kiting = true;
                     self.dodge_goal = None;
-                    if mode == Mode::Cover {
-                        mode = Mode::Fight;
+                    if mode == Mode::Cover || mode == Mode::Hide {
+                        mode = if mode == Mode::Hide { Mode::Flee } else { Mode::Fight };
                     }
                 }
             }
@@ -1903,7 +2132,7 @@ impl Brain {
         }
 
         // Keep inside the goal circle while fighting / farming.
-        if matches!(mode, Mode::Fight | Mode::Farm) && dist2(p2, gc) > gr {
+        if matches!(mode, Mode::Fight | Mode::Farm | Mode::Flee) && dist2(p2, gc) > gr {
             let inward = unit2([gc[0] - p2[0], gc[1] - p2[1]]);
             mv = unit2([mv[0] + inward[0] * 1.5, mv[1] + inward[1] * 1.5]);
         }
@@ -1964,6 +2193,10 @@ impl Brain {
             let (a, f) = self.weapons_on(obs, tg, muzzle, mode == Mode::Cover, self.sn_active);
             aim = Some(a);
             fire = f;
+            // Hiding: watch it but stay silent (shots are heard 300+ m away).
+            if mode == Mode::Hide && matches!(tg.kind, TargetKind::Mech) {
+                fire = [false, false];
+            }
         }
         // Being hurt by someone we cannot see (usually from behind, x1.5): turn to face it.
         if self.prm.turn_unseen > 0.0 && tgt_hp > 300.0 {
