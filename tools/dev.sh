@@ -4,4 +4,4 @@
 # Usage: tools/dev.sh cargo build --release -p sim
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) REPO="$(cygpath -w "$REPO")";; esac
-exec docker run --rm -i -v "$REPO:/work" -v mech-target:/target -v mech-cargo:/usr/local/cargo/registry mech-dev "$@"
+exec docker run --rm -i -v "$REPO:/work" -v ${TARGET_VOL:-mech-target}:/target -v mech-bins:/bins -v mech-cargo:/usr/local/cargo/registry mech-dev "$@"
