@@ -339,6 +339,75 @@ impl Brain {
         best.map(|b| b.1)
     }
 
+    /// Direction to sidestep incoming projectiles, if any threaten us.
+    fn projectile_dodge(&self, obs: &Obs, my_scale: f32) -> Option<[f32; 2]> {
+        let me = &obs.me;
+        let c = [me.pos[0], me.pos[1], me.pos[2] + 4.5 * my_scale];
+        let r = 2.5 * my_scale;
+        let g = cfgf(&self.cfg, &["weapons", "mortar", "gravity"], 22.0);
+        let splash = cfgf(&self.cfg, &["weapons", "mortar", "splash_radius"], 7.0);
+        let mut acc = [0.0f32, 0.0];
+        let mut any = false;
+        for p in &obs.projectiles {
+            if p.kind == "mortar" {
+                // Integrate the shell to impact.
+                let (mut q, mut v) = (p.pos, p.vel);
+                let mut t = 0.0;
+                while t < 5.0 {
+                    v[2] -= g * 0.05;
+                    q = add(q, scale(v, 0.05));
+                    t += 0.05;
+                    if q[2] < self.world.surface_below(q[0], q[1], q[2] + 2.0, 0.0) || self.world.solid(q[0], q[1], q[2]) {
+                        break;
+                    }
+                    if q[2] > c[2] - 4.5 && q[2] < c[2] + 4.5 && hdist(q, c) < r + 0.5 {
+                        break;
+                    }
+                }
+                let d = hdist(q, c);
+                if d < splash + r + 2.0 && t < 4.0 {
+                    let away = unit2([c[0] - q[0], c[1] - q[1]]);
+                    let away = if away == [0.0, 0.0] { unit2([-v[1], v[0]]) } else { away };
+                    acc[0] += away[0] * 2.0;
+                    acc[1] += away[1] * 2.0;
+                    any = true;
+                }
+                continue;
+            }
+            // Straight bullets: closest approach.
+            let rel = sub(c, p.pos);
+            let vv = p.vel;
+            let v2 = vv[0] * vv[0] + vv[1] * vv[1] + vv[2] * vv[2];
+            if v2 < 1.0 {
+                continue;
+            }
+            let tca = (rel[0] * vv[0] + rel[1] * vv[1] + rel[2] * vv[2]) / v2;
+            if !(0.04..=1.2).contains(&tca) {
+                continue;
+            }
+            let cp = add(p.pos, scale(vv, tca));
+            let miss = sub(cp, c);
+            let hmiss = (miss[0] * miss[0] + miss[1] * miss[1]).sqrt();
+            if hmiss < r + 1.2 && miss[2].abs() < 5.5 * my_scale {
+                // Move perpendicular to the bullet, toward the side it already misses on.
+                let mut side = unit2([-vv[1], vv[0]]);
+                if side[0] * miss[0] + side[1] * miss[1] > 0.0 {
+                    side = [-side[0], -side[1]];
+                }
+                let w = if p.kind == "npc" { 0.4 } else { 1.0 };
+                acc[0] += side[0] * w;
+                acc[1] += side[1] * w;
+                any = true;
+            }
+        }
+        if any {
+            Some(unit2(acc))
+        } else {
+            None
+        }
+    }
+
+    #[allow(dead_code)]
     fn visible_from(&self, eye: V3, p: V3, scale: f32) -> bool {
         self.world.los(eye, [p[0], p[1], p[2] + 4.5 * scale]) || self.world.los(eye, [p[0], p[1], p[2] + 8.8 * scale])
     }
@@ -791,6 +860,15 @@ impl Brain {
                 }
             } else {
                 self.dodge_goal = None;
+            }
+        }
+
+        // Projectile dodge: steer away from bullets/shells predicted to hit us.
+        if let Some(dv) = self.projectile_dodge(obs, my_scale) {
+            let blend = unit2([mv[0] * 0.4 + dv[0], mv[1] * 0.4 + dv[1]]);
+            if self.nav.walkable_at(p2[0] + blend[0] * 3.0, p2[1] + blend[1] * 3.0) {
+                mv = blend;
+                want_boost = true;
             }
         }
 
