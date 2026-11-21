@@ -327,7 +327,7 @@ impl Default for Params {
             mlz: 1.0,
             lj_t0: 0.15,
             lj_len: 0.6,
-            surv: 0.0,
+            surv: 1.0,
             surv_k: 3.0,
             surv_t: 90.0,
             surv_d: 45.0,
