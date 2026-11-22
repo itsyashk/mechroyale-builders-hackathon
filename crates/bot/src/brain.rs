@@ -312,6 +312,10 @@ pub struct Params {
     pub nlr: f32,
     pub nlr_t: f32,
     pub nlr_d: f32,
+    /// 1 = dual-special kit: route loot to complete laser+lightning, drop the gun for the second special.
+    pub dsk: f32,
+    /// Extra loot reach (m) for the missing lightning / second special.
+    pub dsk_reach: f32,
 }
 
 impl Default for Params {
@@ -385,6 +389,8 @@ impl Default for Params {
             nlr: 2.0,
             nlr_t: 90.0,
             nlr_d: 35.0,
+            dsk: 0.0,
+            dsk_reach: 120.0,
         }
     }
 }
@@ -466,6 +472,8 @@ impl Params {
                     "nlr" => p.nlr = x,
                     "nlr_t" => p.nlr_t = x,
                     "nlr_d" => p.nlr_d = x,
+                    "dsk" => p.dsk = x,
+                    "dsk_reach" => p.dsk_reach = x,
                     _ => eprintln!("unknown param {k}"),
                 }
             }
@@ -1422,6 +1430,31 @@ impl Brain {
         let has = |k: &str| slot_kind(0) == k || slot_kind(1) == k;
         let have_laser = has("laser");
         let have_light = has("lightning");
+        // Dual-special kit helpers.
+        let dsk = self.prm.dsk > 0.5;
+        let dsk_both = dsk && have_laser && have_light;
+        let dsk_hunter_near = enemies.iter().any(|m| hdist(m.pos, pos) < 100.0)
+            || self.tracks.values().any(|t| obs.t - t.seen_t < 3.0 && hdist(t.pos, pos) < 100.0);
+        // Slot to give up for a missing special: Some(None) = free slot, Some(Some(i)) = swap slot i, None = not allowed.
+        let dsk_drop = |kind: &str| -> Option<Option<usize>> {
+            if slot_kind(0).is_empty() || slot_kind(1).is_empty() {
+                return Some(None);
+            }
+            for i in 0..2 {
+                if !matches!(slot_kind(i), "gun" | "laser" | "lightning") {
+                    return Some(Some(i));
+                }
+            }
+            let gi = if slot_kind(0) == "gun" { 0 } else if slot_kind(1) == "gun" { 1 } else { return None };
+            if me.cubes >= 1 && !dsk_hunter_near {
+                return Some(Some(gi));
+            }
+            if kind == "laser" {
+                // Baseline laser-magnet behaviour: keep the gun, give up the other slot.
+                return Some(Some(1 - gi));
+            }
+            None
+        };
 
         // ---- fight or flight
         let tgt_hp = target_mech.as_ref().map(|t| t.0.hp.unwrap_or(1400.0)).unwrap_or(0.0);
@@ -1587,8 +1620,32 @@ impl Brain {
                 }
             };
             let mut best_p: Option<(f32, i64, V3)> = None;
+            let mut best_drop: Option<usize> = None;
             for (id, (kind, pp, _)) in &self.pickups {
                 if self.bad_pickups.contains_key(id) || has(kind) {
+                    continue;
+                }
+                if dsk {
+                    // Dual-special kit: only laser / lightning pickups, until both are held.
+                    if dsk_both || !(kind == "laser" || kind == "lightning") {
+                        continue;
+                    }
+                    let Some(dr) = dsk_drop(kind) else { continue };
+                    if dist2(xy(*pp), gc) > gr + 10.0 {
+                        continue;
+                    }
+                    let d = hdist(*pp, pos);
+                    let reach = if slot_kind(1).is_empty() || slot_kind(0).is_empty() { 260.0 } else { 150.0 } + if kind == "laser" { self.prm.sn_loot } else { self.prm.dsk_reach };
+                    if d > reach {
+                        continue;
+                    }
+                    // Corpse piles (several weapons together) are the best places to complete the kit.
+                    let pile = self.pickups.iter().filter(|(oid, (_, op, _))| *oid != id && hdist(*op, *pp) < 8.0).count() as f32;
+                    let s = d - 60.0 - 20.0 * pile;
+                    if best_p.map(|b| s < b.0).unwrap_or(true) {
+                        best_p = Some((s, *id, *pp));
+                        best_drop = dr;
+                    }
                     continue;
                 }
                 let pr = self.prm.prio(kind);
@@ -1618,8 +1675,11 @@ impl Brain {
                 goal = Some(xy(pp));
                 let dz = (pp[2] - pos[2]).abs();
                 if hdist(pp, pos) < self.pickup_radius - 0.6 && dz < 3.8 {
-                    let drop = if slot_kind(worst_slot.0).is_empty() { None } else { Some(worst_slot.0) };
+                    let drop = if dsk { best_drop } else if slot_kind(worst_slot.0).is_empty() { None } else { Some(worst_slot.0) };
                     take = Some((id, drop));
+                }
+                if dsk && hdist(pp, pos) > 20.0 {
+                    want_boost = true;
                 }
             }
             // Cubes.
@@ -1948,13 +2008,14 @@ impl Brain {
         }
 
         // Laser magnet: a laser on the ground nearby is worth breaking off for, even mid-fight.
-        if self.prm.sn_loot > 0.0 && !have_laser && !self.retreating && !zone_urgent && matches!(mode, Mode::Fight | Mode::Cover | Mode::Farm | Mode::Hold | Mode::Roam) {
+        let dsk_need_light = dsk && have_laser && !have_light;
+        if self.prm.sn_loot > 0.0 && (!have_laser || dsk_need_light) && !self.retreating && !zone_urgent && matches!(mode, Mode::Fight | Mode::Cover | Mode::Farm | Mode::Hold | Mode::Roam) {
             let near = self
                 .pickups
                 .iter()
-                .filter(|(id, (k, pp, _))| k == "laser" && !self.bad_pickups.contains_key(id) && dist2(xy(*pp), gc) < gr && (pp[2] - pos[2]).abs() < 6.0)
+                .filter(|(id, (k, pp, _))| (k == "laser" && !have_laser || dsk_need_light && k == "lightning") && !self.bad_pickups.contains_key(id) && dist2(xy(*pp), gc) < gr && (pp[2] - pos[2]).abs() < 6.0)
                 .map(|(id, (_, pp, _))| (*id, *pp, hdist(*pp, pos)))
-                .filter(|x| x.2 < self.prm.sn_loot * if mode == Mode::Fight || mode == Mode::Cover { 0.5 } else { 1.0 })
+                .filter(|x| x.2 < (if dsk_need_light { self.prm.dsk_reach } else { self.prm.sn_loot }) * if mode == Mode::Fight || mode == Mode::Cover { 0.5 } else { 1.0 })
                 .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
             if let Some((id, pp, d)) = near {
                 mv = self.goto(p2, xy(pp));
@@ -1962,8 +2023,11 @@ impl Brain {
                 if mode == Mode::Farm {
                     aux_target = None;
                 }
-                if d < self.pickup_radius - 0.6 && (pp[2] - pos[2]).abs() < 3.8 {
-                    let drop = if slot_kind(0).is_empty() || slot_kind(1).is_empty() {
+                let dsk_choice = if dsk { dsk_drop(if dsk_need_light { "lightning" } else { "laser" }) } else { None };
+                if d < self.pickup_radius - 0.6 && (pp[2] - pos[2]).abs() < 3.8 && !(dsk && dsk_choice.is_none()) {
+                    let drop = if let Some(dc) = dsk_choice {
+                        dc
+                    } else if slot_kind(0).is_empty() || slot_kind(1).is_empty() {
                         None
                     } else if slot_kind(0) == "gun" {
                         Some(1)
