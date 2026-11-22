@@ -312,6 +312,12 @@ pub struct Params {
     pub nlr: f32,
     pub nlr_t: f32,
     pub nlr_d: f32,
+    /// 1 = skip cubes (loot/farm/magnet) once at the stat cap, unless a hunter would take them first.
+    pub cube_deny: f32,
+    /// Carried-cube count at/above which cube_deny applies.
+    pub cube_cap: f32,
+    /// Weight of the 5 m repulsion from unwanted cubes while above the cap.
+    pub cube_rep: f32,
 }
 
 impl Default for Params {
@@ -385,6 +391,9 @@ impl Default for Params {
             nlr: 2.0,
             nlr_t: 90.0,
             nlr_d: 35.0,
+            cube_deny: 0.0,
+            cube_cap: 10.0,
+            cube_rep: 1.0,
         }
     }
 }
@@ -466,6 +475,9 @@ impl Params {
                     "nlr" => p.nlr = x,
                     "nlr_t" => p.nlr_t = x,
                     "nlr_d" => p.nlr_d = x,
+                    "cube_deny" => p.cube_deny = x,
+                    "cube_cap" => p.cube_cap = x,
+                    "cube_rep" => p.cube_rep = x,
                     _ => eprintln!("unknown param {k}"),
                 }
             }
@@ -1334,6 +1346,25 @@ impl Brain {
 
         // ---- enemies
         let enemies: Vec<&Mech> = obs.mechs.iter().filter(|m| m.is_mech() && m.id != me.id).collect();
+        // Cube diet: above the stat cap extra cubes only grow our hitbox; leave them unless a hunter would grab them.
+        let cube_diet = self.prm.cube_deny > 0.5 && (me.cubes as f32) >= self.prm.cube_cap;
+        let cube_wanted = |cp: V3| -> bool {
+            if !cube_diet {
+                return true;
+            }
+            let dm = hdist(cp, me.pos);
+            let mut near = false;
+            for e in &enemies {
+                let de = hdist(e.pos, cp);
+                if de < 35.0 {
+                    near = true;
+                    if de < dm {
+                        return false;
+                    }
+                }
+            }
+            near
+        };
         let attackers: Vec<i64> = self.dmg_log.iter().filter(|d| obs.t - d.0 < 3.0).filter_map(|d| d.2).collect();
         let dmg_by = |id: i64, log: &Vec<(f32, f32, Option<i64>, f32)>| -> f32 {
             log.iter().filter(|d| obs.t - d.0 < 2.0 && d.2 == Some(id)).map(|d| d.3).sum()
@@ -1627,7 +1658,7 @@ impl Brain {
                 if let Some(c) = obs
                     .cubes
                     .iter()
-                    .filter(|c| hdist(c.pos, pos) < 70.0 && dist2(xy(c.pos), gc) < gr + 5.0)
+                    .filter(|c| hdist(c.pos, pos) < 70.0 && dist2(xy(c.pos), gc) < gr + 5.0 && cube_wanted(c.pos))
                     .min_by(|a, b| hdist(a.pos, pos).partial_cmp(&hdist(b.pos, pos)).unwrap())
                 {
                     mode = Mode::Loot;
@@ -1652,7 +1683,7 @@ impl Brain {
             // Crates and NPC drones for cubes.
             if mode == Mode::Roam {
                 let gun_ok = slot_kind(0) == "gun" || slot_kind(1) == "gun" || have_laser || have_light;
-                if gun_ok {
+                if gun_ok && !cube_diet {
                     if let Some(c) = obs
                         .crates
                         .iter()
@@ -2026,7 +2057,7 @@ impl Brain {
             if let Some(c) = obs
                 .cubes
                 .iter()
-                .filter(|c| hdist(c.pos, pos) < self.prm.magnet && dist2(xy(c.pos), gc) < gr + 5.0 && (c.pos[2] - pos[2]).abs() < 4.0)
+                .filter(|c| hdist(c.pos, pos) < self.prm.magnet && dist2(xy(c.pos), gc) < gr + 5.0 && (c.pos[2] - pos[2]).abs() < 4.0 && cube_wanted(c.pos))
                 .min_by(|a, b| hdist(a.pos, pos).partial_cmp(&hdist(b.pos, pos)).unwrap())
             {
                 let to = self.goto(p2, xy(c.pos));
@@ -2224,6 +2255,22 @@ impl Brain {
         }
         if act.jump {
             act.boost = me.energy > 5.0;
+        }
+        // Cube diet: steer clear of cubes we do not want (pickup radius ~3.5 m).
+        if cube_diet && self.prm.cube_rep > 0.0 && mode != Mode::Drop {
+            let mut rv = [0.0f32, 0.0];
+            for c in obs.cubes.iter() {
+                let dc = hdist(c.pos, pos);
+                if dc < 5.0 && (c.pos[2] - pos[2]).abs() < 4.0 && !cube_wanted(c.pos) {
+                    let w = (5.0 - dc) / 5.0;
+                    let dir = unit2([pos[0] - c.pos[0], pos[1] - c.pos[1]]);
+                    rv[0] += dir[0] * w;
+                    rv[1] += dir[1] * w;
+                }
+            }
+            if rv[0].abs() + rv[1].abs() > 1e-4 {
+                mv = unit2([mv[0] + rv[0] * self.prm.cube_rep * 1.5, mv[1] + rv[1] * self.prm.cube_rep * 1.5]);
+            }
         }
         act.mv = mv;
 
