@@ -378,7 +378,7 @@ impl Default for Params {
             chg_gun: 0.0,
             lrel: 1.0,
             llead: 0.1,
-            lupg: 0.0,
+            lupg: 2.0,
             lcov: 1.0,
             lhold: 0.0,
             mclus: 0.0,
