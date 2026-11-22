@@ -42,6 +42,10 @@ struct Track {
     first_t: f32,
     /// EMA of the angle between its aim and a perfect gun lead on us (rad): skill estimate.
     aerr: f32,
+    /// Times (s) of recent lateral strafe reversals (ring of 12).
+    rev: Vec<f32>,
+    /// Sign of last significant lateral velocity relative to bearing from us (0 = none).
+    lsign: f32,
 }
 
 /// Per-opponent engagement record (MECHBOT_DUEL instrumentation).
@@ -163,6 +167,8 @@ pub struct Brain {
     debug: bool,
     debug_every: u64,
     gstat: [u32; 7],
+    /// sph stats: [mech aim calls, rhythm model used, fire skipped, unused, cv sum*1000, cv samples]
+    sph_stat: [f32; 6],
     dodge_goal: Option<[f32; 2]>,
     dodge_check_t: f32,
     dodges: u32,
@@ -307,6 +313,12 @@ pub struct Params {
     pub lcook: f32,
     /// 1 = never retreat (full berserk).
     pub noret: f32,
+    /// Strafe-phase lead: model the target's next strafe reversal in gun/mortar lead.
+    pub sph: f32,
+    /// Max coefficient of variation of reversal intervals to trust the rhythm.
+    pub sph_cv: f32,
+    /// Skip gun fire when the predicted reversal lands at impact (+-0.1 s).
+    pub sph_skip: f32,
     /// Remember out-of-view enemies for this many s (cover choice, threat estimate).
     pub memt: f32,
     pub nlr: f32,
@@ -381,6 +393,9 @@ impl Default for Params {
             mclus: 0.0,
             lcook: 0.0,
             noret: 1.0,
+            sph: 0.0,
+            sph_cv: 0.35,
+            sph_skip: 1.0,
             memt: 0.0,
             nlr: 2.0,
             nlr_t: 90.0,
@@ -462,6 +477,9 @@ impl Params {
                     "mclus" => p.mclus = x,
                     "lcook" => p.lcook = x,
                     "noret" => p.noret = x,
+                    "sph" => p.sph = x,
+                    "sph_cv" => p.sph_cv = x,
+                    "sph_skip" => p.sph_skip = x,
                     "memt" => p.memt = x,
                     "nlr" => p.nlr = x,
                     "nlr_t" => p.nlr_t = x,
@@ -638,6 +656,7 @@ impl Brain {
             duel_on: std::env::var("MECHBOT_DUEL").is_ok(),
             debug: std::env::var("MECHBOT_DEBUG").is_ok(),
             gstat: [0; 7],
+            sph_stat: [0.0; 6],
             debug_every: std::env::var("MECHBOT_DEBUG").ok().and_then(|v| v.parse().ok()).unwrap_or(10).max(1),
         })
     }
@@ -770,6 +789,10 @@ impl Brain {
 
     pub fn log_end(&self, raw: &str) {
         eprintln!("end: {raw} gunstat[mech_ticks,fire,nolos,range,ammo/reload,aim,hold]={:?} sniper[peek,hide,nopair,_]={:?}", self.gstat, self.sn_stat);
+        if self.prm.sph > 0.5 {
+            let st = &self.sph_stat;
+            eprintln!("sph: aimcalls={} model={} skipped={} cv_mean={:.3} (n={})", st[0], st[1], st[2], st[4] / 1000.0 / st[5].max(1.0), st[5]);
+        }
         if self.ws.on {
             let w = &self.ws;
             eprintln!(
@@ -1252,6 +1275,24 @@ impl Brain {
             let first_t = self.tracks.get(&m.id).map(|t| t.first_t).unwrap_or(obs.t);
             let charge_t0 = self.tracks.get(&m.id).filter(|t| t.charging && t.charge_t0 >= 0.0 && obs.t - t.seen_t < 0.3).map(|t| t.charge_t0).unwrap_or(obs.t);
             let mut aerr = self.tracks.get(&m.id).map(|t| t.aerr).unwrap_or(0.05);
+            let (mut rev, mut lsign) = self.tracks.get(&m.id).map(|t| (t.rev.clone(), t.lsign)).unwrap_or((Vec::new(), 0.0));
+            {
+                let to = unit2([m.pos[0] - pos[0], m.pos[1] - pos[1]]);
+                let vlat = -to[1] * m.vel[0] + to[0] * m.vel[1];
+                if vlat.abs() > 3.0 {
+                    let sg = vlat.signum();
+                    if lsign != 0.0 && sg != lsign {
+                        rev.push(obs.t);
+                        if rev.len() > 12 {
+                            rev.remove(0);
+                        }
+                    }
+                    lsign = sg;
+                }
+                if rev.last().map(|l| obs.t - *l > 6.0).unwrap_or(false) {
+                    rev.clear();
+                }
+            }
             {
                 let d = hdist(m.pos, pos);
                 let their_muz = [m.pos[0], m.pos[1], m.pos[2] + 7.0];
@@ -1279,6 +1320,8 @@ impl Brain {
                     seen_t: obs.t,
                     first_t,
                     aerr,
+                    rev,
+                    lsign,
                 },
             );
         }
@@ -2427,11 +2470,50 @@ impl Brain {
         let w = |i: usize| me.weapons[i].as_ref().unwrap();
 
         // Default aim: gun intercept (or straight at the target).
+        // Strafe-phase model: (time to next reversal, lateral unit) if the rhythm is trusted.
+        let mut ph: Option<(f32, [f32; 2])> = None;
+        let mut ph_skip = false;
+        if self.prm.sph > 0.5 && matches!(tg.kind, TargetKind::Mech) && grounded {
+            if let Some(tr) = self.tracks.get(&tg.id) {
+                if tr.rev.len() >= 4 && obs.t - tr.seen_t < 0.3 {
+                    let n = tr.rev.len() - 1;
+                    let mut sum = 0.0;
+                    for i in 0..n {
+                        sum += tr.rev[i + 1] - tr.rev[i];
+                    }
+                    let mean = sum / n as f32;
+                    let mut var = 0.0;
+                    for i in 0..n {
+                        let x = tr.rev[i + 1] - tr.rev[i] - mean;
+                        var += x * x;
+                    }
+                    let cv = (var / n as f32).sqrt() / mean.max(0.05);
+                    self.sph_stat[4] += cv * 1000.0;
+                    self.sph_stat[5] += 1.0;
+                    let tsr = obs.t - tr.rev[n];
+                    if cv < self.prm.sph_cv && mean > 0.15 && tsr < mean * 1.3 {
+                        let to = unit2([tg.pos[0] - pos[0], tg.pos[1] - pos[1]]);
+                        ph = Some(((mean - tsr).max(0.05), [-to[1], to[0]]));
+                    }
+                }
+            }
+        }
+        self.sph_stat[0] += 1.0;
         let gun_aim = gun.map(|g| {
             let sp = w(g).stat("speed", 252.0);
+            if let Some((trev, perp)) = ph {
+                let (q, tf) = intercept_ph(muzzle, center, tg.vel, sp, 3.0, 0.05, trev, perp);
+                if self.prm.sph_skip > 0.5 && d > 30.0 && (tf + 0.05 - trev).abs() < 0.1 {
+                    ph_skip = true;
+                }
+                return aim_at(muzzle, q);
+            }
             let (q, _) = intercept(muzzle, center, tg.vel, sp, 3.0, 0.05, grounded);
             aim_at(muzzle, q)
         });
+        if ph.is_some() {
+            self.sph_stat[1] += 1.0;
+        }
         let direct = aim_at(muzzle, add(center, scale(tg.vel, self.prm.llead)));
         let mut aim = gun_aim.unwrap_or(direct);
 
@@ -2490,7 +2572,11 @@ impl Brain {
                 aligned(ga)
             };
             if los && d < range && ammo > 0.0 && !reloading && ok_aim && allow {
-                fire[gi] = true;
+                if ph_skip && !fire.iter().any(|f| *f) {
+                    self.sph_stat[2] += 1.0;
+                } else {
+                    fire[gi] = true;
+                }
             }
             if matches!(tg.kind, TargetKind::Mech) {
                 let k = if fire[gi] {
@@ -2550,6 +2636,10 @@ impl Brain {
                     sol = ballistic(dd, h, sp, g, !los).filter(|s| s.0 <= maxp).or_else(|| ballistic(dd, h, sp, g, false));
                     if let Some((_, tf)) = sol {
                         tp = add(tg.pos, scale([tg.vel[0], tg.vel[1], 0.0], tf + 0.05));
+                        if let Some((trev, perp)) = ph {
+                            let o = phase_offset([tg.vel[0], tg.vel[1], 0.0], perp, trev, tf + 0.05);
+                            tp = add(tg.pos, o);
+                        }
                     }
                 }
                 if let Some((pitch, _)) = sol {
@@ -2564,4 +2654,29 @@ impl Brain {
 
         (aim, fire)
     }
+}
+
+/// Displacement of a target over `tt` s, given its lateral (perp) velocity component flips
+/// sign at `trev` s (with a 0.2 s acceleration ramp).
+fn phase_offset(vel: V3, perp: [f32; 2], trev: f32, tt: f32) -> V3 {
+    let vl = vel[0] * perp[0] + vel[1] * perp[1];
+    let dv = [-2.0 * vl * perp[0], -2.0 * vl * perp[1], 0.0];
+    let mut o = scale(vel, tt);
+    let u = tt - trev;
+    if u > 0.0 {
+        let i = if u <= 0.2 { u * u / 0.4 } else { u - 0.1 };
+        o = add(o, scale(dv, i));
+    }
+    o
+}
+
+/// Like `intercept` but with a predicted strafe reversal `trev` s from now.
+fn intercept_ph(from: V3, p: V3, vel: V3, v: f32, lead_out: f32, extra_t: f32, trev: f32, perp: [f32; 2]) -> (V3, f32) {
+    let mut t = (len3(sub(p, from)) - lead_out).max(0.0) / v;
+    let mut q = p;
+    for _ in 0..4 {
+        q = add(p, phase_offset(vel, perp, trev, t + extra_t));
+        t = (len3(sub(q, from)) - lead_out).max(0.0) / v;
+    }
+    (q, t)
 }
