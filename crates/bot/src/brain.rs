@@ -316,6 +316,8 @@ pub struct Params {
     pub dsk: f32,
     /// Extra loot reach (m) for the missing lightning / second special.
     pub dsk_reach: f32,
+    /// 1 = dsk may drop the gun for the second special (0 = keep the gun).
+    pub dsk_dg: f32,
 }
 
 impl Default for Params {
@@ -391,6 +393,7 @@ impl Default for Params {
             nlr_d: 35.0,
             dsk: 1.0,
             dsk_reach: 120.0,
+            dsk_dg: 0.0,
         }
     }
 }
@@ -474,6 +477,7 @@ impl Params {
                     "nlr_d" => p.nlr_d = x,
                     "dsk" => p.dsk = x,
                     "dsk_reach" => p.dsk_reach = x,
+                    "dsk_dg" => p.dsk_dg = x,
                     _ => eprintln!("unknown param {k}"),
                 }
             }
@@ -1446,7 +1450,7 @@ impl Brain {
                 }
             }
             let gi = if slot_kind(0) == "gun" { 0 } else if slot_kind(1) == "gun" { 1 } else { return None };
-            if me.cubes >= 1 && !dsk_hunter_near {
+            if self.prm.dsk_dg > 0.5 && me.cubes >= 1 && !dsk_hunter_near {
                 return Some(Some(gi));
             }
             if kind == "laser" {
