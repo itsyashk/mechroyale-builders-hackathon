@@ -391,7 +391,7 @@ impl Default for Params {
             nlr: 2.0,
             nlr_t: 90.0,
             nlr_d: 35.0,
-            zsq: 0.0,
+            zsq: 1.0,
             zsq_w: 0.6,
             zsq_c: 40.0,
             zsq_in: 10.0,
