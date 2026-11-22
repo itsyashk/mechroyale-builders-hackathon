@@ -128,6 +128,7 @@ pub struct Params {
     pub lose_r: f64,
     pub fm_exp: f64,
     pub fm_strafe: f64,
+    pub fm_er: f64,
 }
 
 /// Baked-in tuning overrides ("k=v,k=v"), applied on top of both the base and the
@@ -202,6 +203,7 @@ pub fn apply_overrides(p: &mut Params) {
             "lose_r" => p.lose_r = x,
             "fm_exp" => p.fm_exp = x,
             "fm_strafe" => p.fm_strafe = x,
+            "fm_er" => p.fm_er = x,
             _ => {}
         }
     }
@@ -235,6 +237,7 @@ pub fn default_params() -> Params {
         lose_r: 160.0,
         fm_exp: 30.0,
         fm_strafe: 9.0,
+        fm_er: 170.0,
         ..Default::default()
     };
     // per-slot table from bot.py (unset = 140)
@@ -1829,7 +1832,7 @@ impl Brain {
             }
             let body = [cx, cy, cz + me.stats.height * 0.6];
             for e in seen {
-                if e.same(tg) || hyp(e.pos[0] - cx, e.pos[1] - cy) > 170.0 {
+                if e.same(tg) || hyp(e.pos[0] - cx, e.pos[1] - cy) > self.p.fm_er {
                     continue;
                 }
                 if w.clear(self.eye(e), body) {
