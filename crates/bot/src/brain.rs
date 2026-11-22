@@ -105,6 +105,18 @@ struct WStat {
     takes: Vec<String>,
 }
 
+/// Sightline summary of a 12 m grid cell (16 rays at 6 m height, 100 m).
+#[derive(Clone, Copy)]
+struct LaneCell {
+    frac_short: f32,
+    open_deg: f32,
+    arcs: u8,
+    bear: f32,
+    roof: bool,
+}
+
+const LANE_STEP: f32 = 12.0;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Mode {
     Zone,
@@ -189,6 +201,14 @@ pub struct Brain {
     juke_dir: [f32; 2],
     juke_src: i64,
     akl_prev: [f32; 2],
+    lane_cell: Option<[f32; 2]>,
+    lane_bear: f32,
+    lane_pick_t: f32,
+    lane_start: f32,
+    lane_arr: bool,
+    lane_seen_t: f32,
+    lane_cache: HashMap<(i32, i32), Option<LaneCell>>,
+    lane_stat: [u32; 4],
     ws: WStat,
     /// Death instrumentation: (t, by, weapon, amount, rear, dist to attacker or -1).
     dth_log: VecDeque<(f32, i64, String, f32, bool, f32)>,
@@ -312,6 +332,13 @@ pub struct Params {
     pub nlr: f32,
     pub nlr_t: f32,
     pub nlr_d: f32,
+    /// 1 = fight from short-sightline / narrow-opening lane cells when >= lane_n hunters are known.
+    pub lane: f32,
+    pub lane_n: f32,
+    pub lane_idle: f32,
+    pub lane_r: f32,
+    pub lane_gap: f32,
+    pub lane_near: f32,
 }
 
 impl Default for Params {
@@ -385,6 +412,12 @@ impl Default for Params {
             nlr: 2.0,
             nlr_t: 90.0,
             nlr_d: 35.0,
+            lane: 0.0,
+            lane_n: 3.0,
+            lane_idle: 6.0,
+            lane_r: 50.0,
+            lane_gap: 8.0,
+            lane_near: 40.0,
         }
     }
 }
@@ -466,6 +499,12 @@ impl Params {
                     "nlr" => p.nlr = x,
                     "nlr_t" => p.nlr_t = x,
                     "nlr_d" => p.nlr_d = x,
+                    "lane" => p.lane = x,
+                    "lane_n" => p.lane_n = x,
+                    "lane_idle" => p.lane_idle = x,
+                    "lane_r" => p.lane_r = x,
+                    "lane_gap" => p.lane_gap = x,
+                    "lane_near" => p.lane_near = x,
                     _ => eprintln!("unknown param {k}"),
                 }
             }
@@ -627,6 +666,14 @@ impl Brain {
             juke_dir: [0.0, 0.0],
             juke_src: -1,
             akl_prev: [0.0, 0.0],
+            lane_cell: None,
+            lane_bear: 0.0,
+            lane_pick_t: -100.0,
+            lane_start: 0.0,
+            lane_arr: false,
+            lane_seen_t: 0.0,
+            lane_cache: HashMap::new(),
+            lane_stat: [0; 4],
             ws: WStat { on: std::env::var("MECHBOT_WSTAT").is_ok(), laser_t: -1.0, first_w2_t: -1.0, ..Default::default() },
             dth_log: VecDeque::new(),
             dth_hist: VecDeque::new(),
@@ -921,6 +968,94 @@ impl Brain {
             }
             None => unit2([goal[0] - pos[0], goal[1] - pos[1]]),
         }
+    }
+
+    fn lane_info(&mut self, ci: (i32, i32)) -> Option<LaneCell> {
+        if let Some(v) = self.lane_cache.get(&ci) {
+            return *v;
+        }
+        let c = [ci.0 as f32 * LANE_STEP, ci.1 as f32 * LANE_STEP];
+        let r = if !self.nav.walkable_at(c[0], c[1]) || self.nav.clearance_at(c[0], c[1]) < 3.2 {
+            None
+        } else {
+            let g = self.world.ground(c[0], c[1]);
+            let eye = [c[0], c[1], g + 6.0];
+            let mut open = [false; 16];
+            let mut short = 0;
+            for k in 0..16 {
+                let a = k as f32 * PI / 8.0;
+                let d = self.world.raycast(eye, [a.cos(), a.sin(), 0.0], 100.0);
+                if d < 45.0 {
+                    short += 1;
+                } else {
+                    open[k] = true;
+                }
+            }
+            let n_open = open.iter().filter(|o| **o).count();
+            if n_open == 0 || n_open == 16 {
+                None
+            } else {
+                let s0 = (0..16).find(|&i| !open[i]).unwrap();
+                let (mut arcs, mut run, mut run_start) = (0u8, 0usize, 0usize);
+                let (mut best_len, mut best_c) = (0usize, 0.0f32);
+                for k in 1..=16 {
+                    let i = (s0 + k) % 16;
+                    if open[i] {
+                        if run == 0 {
+                            run_start = i;
+                            arcs += 1;
+                        }
+                        run += 1;
+                    } else if run > 0 {
+                        if run > best_len {
+                            best_len = run;
+                            best_c = (run_start as f32 + (run as f32 - 1.0) * 0.5) * PI / 8.0;
+                        }
+                        run = 0;
+                    }
+                }
+                let up = self.world.raycast(eye, [0.0, 0.0, 1.0], 30.0);
+                Some(LaneCell { frac_short: short as f32 / 16.0, open_deg: n_open as f32 * 22.5, arcs, bear: best_c, roof: up < 29.0 })
+            }
+        };
+        self.lane_cache.insert(ci, r);
+        r
+    }
+
+    /// Best lane cell near `pos`: short sightlines, a narrow opening, inside the safe circle,
+    /// away from known hunters. Returns (cell, opening bearing).
+    fn lane_pick(&mut self, pos: [f32; 2], circle: ([f32; 2], f32), hunters: &[[f32; 2]]) -> Option<([f32; 2], f32)> {
+        let (gc, gr) = circle;
+        let rr = self.prm.lane_r;
+        let n = hunters.len().max(1) as f32;
+        let cen = [hunters.iter().map(|h| h[0]).sum::<f32>() / n, hunters.iter().map(|h| h[1]).sum::<f32>() / n];
+        let (i0, i1) = (((pos[0] - rr) / LANE_STEP).floor() as i32, ((pos[0] + rr) / LANE_STEP).ceil() as i32);
+        let (j0, j1) = (((pos[1] - rr) / LANE_STEP).floor() as i32, ((pos[1] + rr) / LANE_STEP).ceil() as i32);
+        let mut best: Option<(f32, [f32; 2], f32)> = None;
+        for i in i0..=i1 {
+            for j in j0..=j1 {
+                let c = [i as f32 * LANE_STEP, j as f32 * LANE_STEP];
+                let d = dist2(c, pos);
+                if d > rr || dist2(c, gc) > gr * 0.85 {
+                    continue;
+                }
+                if hunters.iter().any(|h| dist2(*h, c) < 40.0) {
+                    continue;
+                }
+                let Some(inf) = self.lane_info((i, j)) else { continue };
+                if inf.open_deg > 100.0 || inf.frac_short < 0.55 {
+                    continue;
+                }
+                let mut sc = 2.0 * inf.frac_short - 0.5 * (inf.arcs as f32 - 1.0) - d / 50.0 + if inf.roof { 0.3 } else { 0.0 };
+                if wrap(inf.bear - yaw_to(c, cen)).abs() < 1.2 {
+                    sc += 0.8;
+                }
+                if best.map(|b| sc > b.0).unwrap_or(true) {
+                    best = Some((sc, c, inf.bear));
+                }
+            }
+        }
+        best.map(|b| (b.1, b.2))
     }
 
     fn eye_of(p: V3, scale: f32) -> V3 {
@@ -2021,6 +2156,73 @@ impl Brain {
             mv = self.goto(p2, g);
         }
 
+        // Lane fight: with several hunters known and none close, fight from a short-sightline,
+        // narrow-opening cell (never wait: abort when nothing shows up, push anything < 55 m).
+        let mut lane_aim: Option<f32> = None;
+        if self.prm.lane > 0.5 {
+            let hunters: Vec<[f32; 2]> = self.tracks.values().filter(|t| obs.t - t.seen_t < 6.0 && hdist(t.pos, pos) < 220.0).map(|t| xy(t.pos)).collect();
+            let nh = hunters.len();
+            let near = hunters.iter().map(|h| dist2(*h, p2)).fold(1e9f32, f32::min);
+            let ok_mode = matches!(mode, Mode::Fight | Mode::Roam) && !zone_urgent && !self.retreating;
+            if let Some(cell) = self.lane_cell {
+                let arrived = dist2(cell, p2) < 4.0;
+                if arrived && !self.lane_arr {
+                    self.lane_arr = true;
+                    self.lane_seen_t = obs.t;
+                    self.lane_stat[1] += 1;
+                }
+                if arrived && target_mech.as_ref().map(|t| t.1).unwrap_or(false) {
+                    self.lane_seen_t = obs.t;
+                }
+                let abort = !ok_mode
+                    || nh <= 1
+                    || near < 25.0
+                    || dist2(cell, gc) > gr
+                    || dist2(cell, p2) > 80.0
+                    || (arrived && obs.t - self.lane_seen_t > self.prm.lane_idle)
+                    || (!arrived && obs.t - self.lane_start > 14.0);
+                if abort {
+                    self.lane_cell = None;
+                    self.lane_stat[2] += 1;
+                }
+            }
+            if self.lane_cell.is_none() && ok_mode && nh as f32 >= self.prm.lane_n && near > self.prm.lane_near && obs.t - self.lane_pick_t >= self.prm.lane_gap {
+                self.lane_pick_t = obs.t;
+                if let Some((c, b)) = self.lane_pick(p2, (gc, gr), &hunters) {
+                    self.lane_cell = Some(c);
+                    self.lane_bear = b;
+                    self.lane_start = obs.t;
+                    self.lane_arr = false;
+                    self.lane_stat[0] += 1;
+                    if self.debug {
+                        eprintln!("  LANE pick t={:.1} cell=({:.0},{:.0}) bear={:.2} nh={} near={:.0}", obs.t, c[0], c[1], b, nh, near);
+                    }
+                }
+            }
+            if let Some(cell) = self.lane_cell {
+                let push = target_mech.as_ref().map(|t| hdist(t.0.pos, pos) < 55.0).unwrap_or(false);
+                if !push {
+                    let d = dist2(cell, p2);
+                    if d > 3.0 {
+                        mv = self.goto(p2, cell);
+                        want_boost = d > 6.0;
+                    } else {
+                        lane_aim = Some(self.lane_bear);
+                        mv = [0.0, 0.0];
+                        if let Some((m, _)) = &target_mech {
+                            let b = yaw_to(p2, xy(m.pos));
+                            let perp = [-b.sin() * self.strafe_sign, b.cos() * self.strafe_sign];
+                            if d > 2.2 {
+                                mv = unit2([cell[0] - p2[0], cell[1] - p2[1]]);
+                            } else if self.nav.walkable_at(p2[0] + perp[0] * 3.0, p2[1] + perp[1] * 3.0) {
+                                mv = perp;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Cube magnet: kills drop cubes (+4% HP and damage each); grab nearby ones even mid-fight.
         if self.prm.magnet > 0.0 && matches!(mode, Mode::Fight | Mode::Farm | Mode::Cover) && !self.retreating {
             if let Some(c) = obs
@@ -2314,7 +2516,7 @@ impl Brain {
                 .filter(|s| s.dist != "far")
                 .map(|s| s.bearing)
                 .next();
-            let yaw = if let Some(b) = recent.or(heard) {
+            let yaw = if let Some(b) = recent.or(heard).or(lane_aim) {
                 b
             } else {
                 let base = if mv[0].abs() + mv[1].abs() > 0.1 { mv[1].atan2(mv[0]) } else { me.aim[0] };
