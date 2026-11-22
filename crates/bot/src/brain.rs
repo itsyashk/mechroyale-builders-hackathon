@@ -254,6 +254,9 @@ pub struct Params {
     pub hp_w: f32,
     pub multi_far: f32,
     pub weak_first: f32,
+    pub triage: f32,
+    pub tri_w: f32,
+    pub tri_iso: f32,
     pub treload: f32,
     pub hold: f32,
     pub hold_t: f32,
@@ -343,6 +346,9 @@ impl Default for Params {
             hp_w: 0.04,
             multi_far: 0.0,
             weak_first: 0.0,
+            triage: 0.0,
+            tri_w: 1.0,
+            tri_iso: 0.6,
             treload: 0.0,
             hold: 0.0,
             hold_t: 40.0,
@@ -424,6 +430,9 @@ impl Params {
                     "hp_w" => p.hp_w = x,
                     "multi_far" => p.multi_far = x,
                     "weak_first" => p.weak_first = x,
+                    "triage" => p.triage = x,
+                    "tri_w" => p.tri_w = x,
+                    "tri_iso" => p.tri_iso = x,
                     "treload" => p.treload = x,
                     "hold" => p.hold = x,
                     "hold_t" => p.hold_t = x,
@@ -1338,6 +1347,7 @@ impl Brain {
         let dmg_by = |id: i64, log: &Vec<(f32, f32, Option<i64>, f32)>| -> f32 {
             log.iter().filter(|d| obs.t - d.0 < 2.0 && d.2 == Some(id)).map(|d| d.3).sum()
         };
+        let has_gun_me = me.weapons.iter().flatten().any(|w| w.kind == "gun");
         let mut best_t: Option<(f32, &Mech, bool)> = None;
         for m in &enemies {
             let scale = 1.0 + 0.05 * m.cubes.unwrap_or(0) as f32;
@@ -1367,6 +1377,68 @@ impl Brain {
             if self.prm.weak_first > 0.0 {
                 let ae = self.tracks.get(&m.id).map(|t| t.aerr).unwrap_or(0.05);
                 s += self.prm.weak_first * (0.04 - ae.min(0.15)) * 800.0;
+            }
+            if self.prm.triage > 0.0 {
+                // Threat per time-to-kill, plus crossfire isolation.
+                let acc = if d < 40.0 {
+                    0.9
+                } else if d < 60.0 {
+                    0.9 - 0.2 * (d - 40.0) / 20.0
+                } else if d < 100.0 {
+                    0.7 - 0.09 * (d - 60.0) / 40.0
+                } else {
+                    (0.61 - 0.25 * (d - 100.0) / 40.0).max(0.2)
+                };
+                let mut dps = 0.0;
+                if m.has("gun") {
+                    dps += 187.0 * acc;
+                }
+                if m.has("laser") {
+                    dps += 150.0 * acc;
+                }
+                if m.has("lightning") && d < 45.0 {
+                    dps += 240.0;
+                }
+                if m.has("mortar") {
+                    dps += 100.0 * acc;
+                }
+                dps *= 1.0 + 0.04 * (m.cubes.unwrap_or(0).min(10) as f32);
+                let mut od = 0.0;
+                if has_gun_me {
+                    od += if d < 60.0 { 120.0 } else if d < 130.0 { 80.0 } else { 45.0 };
+                }
+                if me.weapons.iter().flatten().any(|w| w.kind == "laser") {
+                    od += 120.0;
+                }
+                if me.weapons.iter().flatten().any(|w| w.kind == "lightning") && d < 45.0 {
+                    od += 190.0;
+                }
+                if me.weapons.iter().flatten().any(|w| w.kind == "mortar") {
+                    od += 35.0;
+                }
+                od = (od * (1.0 + 0.04 * (me.cubes.min(10) as f32))).max(30.0);
+                let ttk = hp / od;
+                let tv = (dps / ttk.max(0.5) * 0.8).min(80.0);
+                let mut iso = 0.0;
+                let mut cross = 0.0;
+                let tc = [m.pos[0], m.pos[1], m.pos[2] + 4.5 * scale];
+                for o in &enemies {
+                    if o.id == m.id {
+                        continue;
+                    }
+                    let od2 = hdist(o.pos, m.pos);
+                    if od2 < 45.0 {
+                        iso += 40.0 * self.prm.tri_iso;
+                    }
+                    if cross == 0.0 && od2 < 150.0 && hdist(o.pos, pos) < 200.0 && self.world.los(Self::eye_of(o.pos, 1.0 + 0.05 * o.cubes.unwrap_or(0) as f32), tc) {
+                        cross = 30.0 * self.prm.tri_iso;
+                    }
+                }
+                s -= self.prm.tri_w * tv;
+                s += iso + cross;
+                if self.debug && self.ticks % self.debug_every == 0 {
+                    eprintln!("tri id={} d={:.0} dps={:.0} ttk={:.1} tv={:.0} iso={:.0} cross={:.0}", m.id, d, dps, ttk, tv, iso, cross);
+                }
             }
             if best_t.map(|b| s < b.0).unwrap_or(true) {
                 best_t = Some((s, m, shootable));
