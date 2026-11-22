@@ -126,6 +126,8 @@ pub struct Params {
     pub lose_h2: f64,
     pub lose_h3: f64,
     pub lose_r: f64,
+    pub fm_exp: f64,
+    pub fm_strafe: f64,
 }
 
 /// Baked-in tuning overrides ("k=v,k=v"), applied on top of both the base and the
@@ -198,6 +200,8 @@ pub fn apply_overrides(p: &mut Params) {
             "lose_h2" => p.lose_h2 = x,
             "lose_h3" => p.lose_h3 = x,
             "lose_r" => p.lose_r = x,
+            "fm_exp" => p.fm_exp = x,
+            "fm_strafe" => p.fm_strafe = x,
             _ => {}
         }
     }
@@ -229,6 +233,8 @@ pub fn default_params() -> Params {
         lose_h2: 0.55,
         lose_h3: 0.8,
         lose_r: 160.0,
+        fm_exp: 30.0,
+        fm_strafe: 9.0,
         ..Default::default()
     };
     // per-slot table from bot.py (unset = 140)
@@ -1827,7 +1833,7 @@ impl Brain {
                     continue;
                 }
                 if w.clear(self.eye(e), body) {
-                    s -= 30.0;
+                    s -= self.p.fm_exp;
                 }
             }
             s -= self.zone_penalty(&o.zone, cx, cy);
@@ -1839,7 +1845,7 @@ impl Brain {
                 s -= (4.0 - cl) * 2.5;
             }
             if want_los > 0.0 {
-                s += 9.0 * (dx * sx + dy * sy);
+                s += self.p.fm_strafe * (dx * sx + dy * sy);
             }
             if k < 0 {
                 s -= 8.0;
