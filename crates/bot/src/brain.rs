@@ -346,7 +346,7 @@ impl Default for Params {
             hp_w: 0.04,
             multi_far: 0.0,
             weak_first: 0.0,
-            triage: 0.0,
+            triage: 1.0,
             tri_w: 1.0,
             tri_iso: 0.6,
             treload: 0.0,
