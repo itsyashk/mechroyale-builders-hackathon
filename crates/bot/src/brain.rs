@@ -224,6 +224,8 @@ fn statf(me: &Me, k: &str, d: f32) -> f32 {
 /// Changes only the bot's random choices (strafe timing etc.), not its strategy: lets the same
 /// strategy be measured on several independent draws.
 pub const SALT: u64 = 0;
+/// Baked-in parameter overrides ("k=v,k=v"), applied before MECHBOT_PARAMS.
+pub const OVERRIDES: &str = "";
 
 /// Strategy knobs. Defaults are the tuned values; MECHBOT_PARAMS="k=v,k=v" overrides
 /// them for local experiments.
@@ -396,7 +398,7 @@ impl Default for Params {
 impl Params {
     pub fn from_env() -> Params {
         let mut p = Params::default();
-        if let Ok(v) = std::env::var("MECHBOT_PARAMS") {
+        for v in [OVERRIDES.to_string(), std::env::var("MECHBOT_PARAMS").unwrap_or_default()] {
             for kv in v.split(',') {
                 let mut it = kv.splitn(2, '=');
                 let (k, val) = (it.next().unwrap_or("").trim(), it.next().and_then(|x| x.trim().parse::<f32>().ok()));
