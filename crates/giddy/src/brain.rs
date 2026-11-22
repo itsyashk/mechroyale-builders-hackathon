@@ -124,6 +124,77 @@ pub struct Params {
     pub lethal_k: f64,
 }
 
+/// Baked-in tuning overrides ("k=v,k=v"), applied on top of both the base and the
+/// practice-mode parameters. Bools take 1/0.
+pub const OVERRIDES: &str = "";
+/// Perturbs only the bot's RNG seed, for independent draws of the same strategy.
+pub const SALT: u64 = 0;
+
+pub fn apply_overrides(p: &mut Params) {
+    for kv in OVERRIDES.split(',') {
+        let mut it = kv.splitn(2, '=');
+        let (k, v) = (it.next().unwrap_or("").trim(), it.next().and_then(|x| x.trim().parse::<f64>().ok()));
+        let Some(x) = v else { continue };
+        match k {
+            "retreat_hp" => p.retreat_hp = x,
+            "recover_hp" => p.recover_hp = x,
+            "gun_range" => p.gun_range = x,
+            "light_range" => p.light_range = x,
+            "laser_range" => p.laser_range = x,
+            "engage_dist" => p.engage_dist = x,
+            "farm_npc" => p.farm_npc = x > 0.5,
+            "explore" => p.explore = x > 0.5,
+            "ghost" => p.ghost = x > 0.5,
+            "home_expo" => p.home_expo = x,
+            "loot_radius" => p.loot_radius = x,
+            "crate_until" => p.crate_until = x,
+            "use_drops" => p.use_drops = x > 0.5,
+            "end_ghost" => p.end_ghost = x,
+            "dodge" => p.dodge = x > 0.5,
+            "no_mortar" => p.no_mortar = x > 0.5,
+            "peek" => p.peek = x > 0.5,
+            "laser_first" => p.laser_first = x > 0.5,
+            "crowd_hide" => p.crowd_hide = x > 0.5,
+            "vulture" => p.vulture = x,
+            "ambush" => p.ambush = x,
+            "laser_seek" => p.laser_seek = x,
+            "lethal" => p.lethal = x > 0.5,
+            "alert" => p.alert = x,
+            "shy" => p.shy = x,
+            "early_hide" => p.early_hide = x,
+            "evade" => p.evade = x > 0.5,
+            "odds" => p.odds = x,
+            "odds_flee" => p.odds_flee = x,
+            "practice" => p.practice = x > 0.5,
+            "stick" => p.stick = x,
+            "hpw" => p.hpw = x,
+            "low_bonus" => p.low_bonus = x,
+            "max_target" => p.max_target = x,
+            "lose_rule" => p.lose_rule = x > 0.5,
+            "fight_loot" => p.fight_loot = x,
+            "farm_hp" => p.farm_hp = x,
+            "all_foes" => p.all_foes = x > 0.5,
+            "cube_goal" => p.cube_goal = x,
+            "econ" => p.econ = x > 0.5,
+            "laser_up" => p.laser_up = x > 0.5,
+            "econ_safe" => p.econ_safe = x,
+            "opening" => p.opening = x > 0.5,
+            "nano_up" => p.nano_up = x > 0.5,
+            "finish" => p.finish = x,
+            "finish_hp" => p.finish_hp = x,
+            "finish_rush" => p.finish_rush = x > 0.5,
+            "pursue" => p.pursue = x,
+            "fight_boost" => p.fight_boost = x,
+            "dodge_boost" => p.dodge_boost = x,
+            "threat_boost" => p.threat_boost = x,
+            "speed_up" => p.speed_up = x > 0.5,
+            "backstab" => p.backstab = x,
+            "lethal_k" => p.lethal_k = x,
+            _ => {}
+        }
+    }
+}
+
 pub fn default_params() -> Params {
     let mut p = Params {
         retreat_hp: 0.38,
@@ -154,6 +225,7 @@ pub fn default_params() -> Params {
     }
 
     p.laser_first = true;
+    apply_overrides(&mut p);
 
     p
 }
@@ -381,6 +453,9 @@ impl Brain {
         let mut seed = h.seed;
         if seed == 0 {
             seed = h.slot + 1;
+        }
+        if SALT != 0 {
+            seed ^= (SALT as i64).wrapping_mul(0x5DEECE66D) | 1;
         }
         Brain {
             w,
@@ -2312,6 +2387,7 @@ pub fn squad_params(mut p: Params) -> Params {
     p.lethal_k = 0.7;
     p.hpw = 0.15;
     p.hpw = 0.18;
+    apply_overrides(&mut p);
 
     p
 }
