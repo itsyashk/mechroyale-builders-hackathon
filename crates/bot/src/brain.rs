@@ -385,7 +385,7 @@ impl Default for Params {
             lupg: 0.0,
             lcov: 1.0,
             lhold: 0.0,
-            lzx: 0.0,
+            lzx: 1.0,
             lzx_wait: 0.5,
             mclus: 0.0,
             lcook: 0.0,
