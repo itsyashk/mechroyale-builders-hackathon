@@ -410,7 +410,7 @@ impl Default for Params {
             nlr: 2.0,
             nlr_t: 90.0,
             nlr_d: 35.0,
-            rwr: 0.0,
+            rwr: 1.0,
             rwr_burst: 8.0,
             rwr_rem: 0.8,
             rwr_gate: 150.0,
