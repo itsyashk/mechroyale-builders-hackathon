@@ -225,7 +225,7 @@ fn statf(me: &Me, k: &str, d: f32) -> f32 {
 /// strategy be measured on several independent draws.
 pub const SALT: u64 = 0;
 /// Baked-in parameter overrides ("k=v,k=v"), applied before MECHBOT_PARAMS.
-pub const OVERRIDES: &str = "";
+pub const OVERRIDES: &str = "sniper=1";
 
 /// Strategy knobs. Defaults are the tuned values; MECHBOT_PARAMS="k=v,k=v" overrides
 /// them for local experiments.
