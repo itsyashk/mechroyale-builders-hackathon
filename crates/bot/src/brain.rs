@@ -188,6 +188,9 @@ pub struct Brain {
     juke_until: f32,
     juke_dir: [f32; 2],
     juke_src: i64,
+    dd_prog: (i64, f32),
+    dd_resets: HashMap<i64, u32>,
+    dd_caps: u32,
     akl_prev: [f32; 2],
     ws: WStat,
     /// Death instrumentation: (t, by, weapon, amount, rear, dist to attacker or -1).
@@ -260,6 +263,9 @@ pub struct Params {
     pub hold_r: f32,
     pub leash: f32,
     pub kite_light: f32,
+    pub drop_dash: f32,
+    pub drop_eta_slack: f32,
+    pub drop_range: f32,
     pub st_lo: f32,
     pub st_hi: f32,
     pub radw: f32,
@@ -349,6 +355,9 @@ impl Default for Params {
             hold_r: 70.0,
             leash: 10.0,
             kite_light: 55.0,
+            drop_dash: 0.0,
+            drop_eta_slack: 6.0,
+            drop_range: 260.0,
             st_lo: 0.45,
             st_hi: 1.3,
             radw: 1.2,
@@ -430,6 +439,9 @@ impl Params {
                     "hold_r" => p.hold_r = x,
                     "leash" => p.leash = x,
                     "kite_light" => p.kite_light = x,
+                    "drop_dash" => p.drop_dash = x,
+                    "drop_eta_slack" => p.drop_eta_slack = x,
+                    "drop_range" => p.drop_range = x,
                     "st_lo" => p.st_lo = x,
                     "st_hi" => p.st_hi = x,
                     "radw" => p.radw = x,
@@ -626,6 +638,9 @@ impl Brain {
             juke_until: -1.0,
             juke_dir: [0.0, 0.0],
             juke_src: -1,
+            dd_prog: (-1, 0.0),
+            dd_resets: HashMap::new(),
+            dd_caps: 0,
             akl_prev: [0.0, 0.0],
             ws: WStat { on: std::env::var("MECHBOT_WSTAT").is_ok(), laser_t: -1.0, first_w2_t: -1.0, ..Default::default() },
             dth_log: VecDeque::new(),
@@ -1200,6 +1215,10 @@ impl Brain {
         // ---- memory updates
         for e in &obs.events {
             match e.kind.as_str() {
+                "drop" => {
+                    self.dd_caps += 1;
+                    eprintln!("dropdash capture #{} t={:.1} hp={:.0}", self.dd_caps, obs.t, me.hp);
+                }
                 "damaged" => {
                     self.last_dmg_t = obs.t;
                     if self.debug {
@@ -1570,6 +1589,68 @@ impl Brain {
             mode = Mode::Roam;
         }
 
+        // Drop-dash: supply drops are an objective (full HP/energy, +3 cubes); go even when hunted.
+        let mut dash = false;
+        if self.prm.drop_dash > 0.5 && !zone_urgent && !obs.drops.is_empty() {
+            let boost_v = statf(me, "boost_speed", 19.5);
+            // Capture-clock reset bookkeeping for the drop we were holding.
+            if let Some(d) = obs.drops.iter().find(|d| d.id == self.dd_prog.0) {
+                if self.dd_prog.1 > 0.5 && d.progress < self.dd_prog.1 - 0.15 {
+                    *self.dd_resets.entry(d.id).or_insert(0) += 1;
+                }
+                self.dd_prog.1 = if d.holder == Some(me.id) { d.progress } else { 0.0 };
+            }
+            let mut best: Option<(f32, usize)> = None;
+            for (i, d) in obs.drops.iter().enumerate() {
+                if d.holder.map(|h| h != me.id).unwrap_or(false) {
+                    continue;
+                }
+                if self.dd_resets.get(&d.id).copied().unwrap_or(0) >= 2 {
+                    continue;
+                }
+                let dd = hdist(d.pos, pos);
+                if dd > self.prm.drop_range || dist2(xy(d.pos), gc) > gr + 5.0 {
+                    continue;
+                }
+                if dd / (boost_v * 0.85) + self.prm.drop_eta_slack < d.lands_in {
+                    continue;
+                }
+                // Finish the fight we are in, unless the ring is right here.
+                if target_mech.is_some() && tgt_d < 35.0 && dd > 25.0 {
+                    continue;
+                }
+                let mut n_near = 0;
+                let mut closer = false;
+                for t in self.tracks.values().filter(|t| obs.t - t.seen_t < 4.0) {
+                    let de = hdist(t.pos, d.pos);
+                    if de < 25.0 {
+                        n_near += 1;
+                    }
+                    if de < dd && de < 40.0 {
+                        closer = true;
+                    }
+                }
+                if n_near >= 2 || (hp_frac < 0.25 && closer) {
+                    continue;
+                }
+                if best.map(|b| dd < b.0).unwrap_or(true) {
+                    best = Some((dd, i));
+                }
+            }
+            if let Some((dd, i)) = best {
+                let d = &obs.drops[i];
+                if self.dd_prog.0 != d.id {
+                    self.dd_prog = (d.id, 0.0);
+                } else if d.holder == Some(me.id) {
+                    self.dd_prog.1 = d.progress;
+                }
+                dash = true;
+                mode = Mode::Drop;
+                goal = Some(xy(d.pos));
+                want_boost = dd > 14.0;
+            }
+        }
+
         // Loot / farm decisions when not engaged.
         if matches!(mode, Mode::Roam) {
             // Weapon pickups.
@@ -1699,7 +1780,7 @@ impl Brain {
         }
         let hold_spot = if holding { self.hold_spot.map(|h| h.0) } else { None };
         if let Some(sp) = hold_spot {
-            if matches!(mode, Mode::Roam | Mode::Farm | Mode::Loot | Mode::Drop) {
+            if !dash && matches!(mode, Mode::Roam | Mode::Farm | Mode::Loot | Mode::Drop) {
                 let near_goal = goal.map(|g| dist2(g, p2) < 18.0 && dist2(g, sp) < 30.0).unwrap_or(false);
                 let need_weapon = slot_kind(0).is_empty() || slot_kind(1).is_empty();
                 let keep = mode == Mode::Loot && (near_goal || need_weapon);
