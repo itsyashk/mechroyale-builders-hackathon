@@ -394,7 +394,7 @@ impl Default for Params {
             nlr: 2.0,
             nlr_t: 90.0,
             nlr_d: 35.0,
-            open: 0.0,
+            open: 1.0,
             open_t: 70.0,
             open_farm: 150.0,
             open_npc: 140.0,
