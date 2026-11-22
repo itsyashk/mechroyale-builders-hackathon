@@ -201,6 +201,9 @@ pub struct Brain {
     dth_myw: String,
     dth_cubes: i32,
     // config numbers
+    snd_buf: Vec<(f32, f32, u8, [f32; 2], u8)>, // event t, bearing, dist bucket, our pos, kind (0 crate, 1 npc_gun, 2 gun/lightning)
+    snd_lock: Option<(f32, f32, u8)>,           // bearing, t0, bucket
+    snd_ignore: f32,
     pickup_radius: f32,
     cube_radius: f32,
     gravity: f32,
@@ -315,6 +318,12 @@ pub struct Params {
     pub nlr_d: f32,
     /// Slew-aware gun trigger + angular-velocity lead (1 = both, 2 = trigger only).
     pub aps: f32,
+    /// 1 = opening economy sprint (bigger farm radius + sound homing) for the first open_t s.
+    pub open: f32,
+    pub open_t: f32,
+    pub open_farm: f32,
+    pub open_npc: f32,
+    pub sound_home: f32,
 }
 
 impl Default for Params {
@@ -389,6 +398,11 @@ impl Default for Params {
             nlr_t: 90.0,
             nlr_d: 35.0,
             aps: 1.0,
+            open: 1.0,
+            open_t: 70.0,
+            open_farm: 150.0,
+            open_npc: 140.0,
+            sound_home: 1.0,
         }
     }
 }
@@ -471,6 +485,11 @@ impl Params {
                     "nlr_t" => p.nlr_t = x,
                     "nlr_d" => p.nlr_d = x,
                     "aps" => p.aps = x,
+                    "open" => p.open = x,
+                    "open_t" => p.open_t = x,
+                    "open_farm" => p.open_farm = x,
+                    "open_npc" => p.open_npc = x,
+                    "sound_home" => p.sound_home = x,
                     _ => eprintln!("unknown param {k}"),
                 }
             }
@@ -604,6 +623,9 @@ impl Brain {
             cover_goal: None,
             target_id: None,
             roam_goal: None,
+            snd_buf: Vec::new(),
+            snd_lock: None,
+            snd_ignore: -1.0,
             boosting: false,
             mode: Mode::Roam,
             ticks: 0,
@@ -894,6 +916,92 @@ impl Brain {
     }
 
     /// Follow an A* path toward `goal`. Returns a unit move vector.
+    /// Opening sprint: where the crate / NPC-gunfire sounds point (triangulated from two bearings
+    /// taken at different spots, else walk along the freshest near/mid bearing for up to 8 s).
+    fn open_goal(&mut self, t: f32, p2: [f32; 2], gc: [f32; 2], gr: f32) -> Option<[f32; 2]> {
+        self.snd_buf.retain(|e| t - e.0 < 14.0);
+        let ign = self.snd_ignore;
+        let loud: Vec<(f32, f32)> = self.snd_buf.iter().filter(|e| e.4 == 2).map(|e| (e.0, e.1)).collect();
+        let ev: Vec<(f32, f32, u8, [f32; 2], u8)> = self
+            .snd_buf
+            .iter()
+            .filter(|e| e.4 < 2 && e.0 > ign)
+            .filter(|e| !(e.4 == 0 && loud.iter().any(|l| (l.0 - e.0).abs() < 2.0 && wrap(l.1 - e.1).abs() < 0.35)))
+            .copied()
+            .collect();
+        if ev.is_empty() {
+            self.snd_lock = None;
+            return None;
+        }
+        let ok = |g: [f32; 2], nav: &Nav| nav.walkable_at(g[0], g[1]) && dist2(g, gc) < gr;
+        // Triangulate.
+        let mut best: Option<(f32, [f32; 2])> = None;
+        for i in 0..ev.len() {
+            for j in (i + 1)..ev.len() {
+                let (a, b) = (&ev[i], &ev[j]);
+                if dist2(a.3, b.3) < 15.0 {
+                    continue;
+                }
+                let (da, db) = ([a.1.cos(), a.1.sin()], [b.1.cos(), b.1.sin()]);
+                let det = da[0] * db[1] - da[1] * db[0];
+                if det.abs() < 0.3 {
+                    continue;
+                }
+                let w = [b.3[0] - a.3[0], b.3[1] - a.3[1]];
+                let s = (w[0] * db[1] - w[1] * db[0]) / det;
+                let u = (w[0] * da[1] - w[1] * da[0]) / det;
+                if s < 5.0 || u < 5.0 || s > 260.0 || u > 260.0 {
+                    continue;
+                }
+                let bucket_ok = |bk: u8, d: f32| match bk {
+                    0 => d < 80.0,
+                    1 => d > 30.0 && d < 190.0,
+                    _ => d > 90.0,
+                };
+                if !bucket_ok(a.2, s) || !bucket_ok(b.2, u) {
+                    continue;
+                }
+                let g = [(a.3[0] + da[0] * s + b.3[0] + db[0] * u) * 0.5, (a.3[1] + da[1] * s + b.3[1] + db[1] * u) * 0.5];
+                let fresh = a.0.min(b.0);
+                if ok(g, &self.nav) && best.map(|x| fresh > x.0).unwrap_or(true) {
+                    best = Some((fresh, g));
+                }
+            }
+        }
+        if let Some((_, g)) = best {
+            self.snd_lock = None;
+            if dist2(g, p2) < 10.0 {
+                self.snd_ignore = t;
+                return None;
+            }
+            return Some(g);
+        }
+        // Single bearing: walk along it.
+        let lock = match self.snd_lock {
+            Some(l) if t - l.1 < 8.0 => Some(l),
+            Some(_) => {
+                self.snd_ignore = t;
+                self.snd_lock = None;
+                None
+            }
+            None => ev
+                .iter()
+                .filter(|e| e.2 <= 1 && t - e.0 < 8.0)
+                .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap())
+                .map(|e| (e.1, t, e.2)),
+        };
+        self.snd_lock = lock;
+        let (b, _, bk) = lock?;
+        let step = if bk == 0 { 35.0 } else { 70.0 };
+        for f in [1.0f32, 0.5, 0.25] {
+            let g = [p2[0] + b.cos() * step * f, p2[1] + b.sin() * step * f];
+            if ok(g, &self.nav) {
+                return Some(g);
+            }
+        }
+        None
+    }
+
     fn goto(&mut self, pos: [f32; 2], goal: [f32; 2]) -> [f32; 2] {
         let replan = self.path.is_empty() || dist2(goal, self.path_goal) > 5.0 || self.t - self.path_t > 2.0;
         if replan {
@@ -1429,6 +1537,32 @@ impl Brain {
         let have_laser = has("laser");
         let have_light = has("lightning");
 
+        // Opening sprint bookkeeping.
+        if self.prm.open > 0.5 && self.prm.sound_home > 0.5 && obs.t < self.prm.open_t {
+            for sn in &obs.sounds {
+                let kind = match sn.kind.as_str() {
+                    "crate" => 0u8,
+                    "npc_gun" => 1,
+                    "gun" | "lightning" => 2,
+                    _ => continue,
+                };
+                let bk = match sn.dist.as_str() {
+                    "near" => 0u8,
+                    "mid" => 1,
+                    _ => 2,
+                };
+                self.snd_buf.push((obs.t - sn.age, sn.bearing, bk, p2, kind));
+            }
+            if self.snd_buf.len() > 48 {
+                let n = self.snd_buf.len() - 48;
+                self.snd_buf.drain(0..n);
+            }
+        }
+        let sprint = self.prm.open > 0.5
+            && obs.t < self.prm.open_t
+            && !(me.cubes >= 6 && have_laser)
+            && !obs.mechs.iter().any(|m| m.kind == "mech" && hdist(m.pos, pos) < 90.0);
+
         // ---- fight or flight
         let tgt_hp = target_mech.as_ref().map(|t| t.0.hp.unwrap_or(1400.0)).unwrap_or(0.0);
         // Engagement estimate: our time-to-kill on the target vs time-to-die under fire.
@@ -1662,17 +1796,18 @@ impl Brain {
                     if let Some(c) = obs
                         .crates
                         .iter()
-                        .filter(|c| hdist(c.pos, pos) < self.prm.farm_range + if have_laser { 0.0 } else { self.prm.sn_loot * 0.5 } && dist2(xy(c.pos), gc) < gr)
+                        .filter(|c| hdist(c.pos, pos) < (if sprint { self.prm.open_farm.max(self.prm.farm_range) } else { self.prm.farm_range }) + if have_laser { 0.0 } else { self.prm.sn_loot * 0.5 } && dist2(xy(c.pos), gc) < gr)
                         .min_by(|a, b| hdist(a.pos, pos).partial_cmp(&hdist(b.pos, pos)).unwrap())
                     {
                         mode = Mode::Farm;
                         aux_target = Some(Target { id: c.id, pos: c.pos, vel: [0.0; 3], kind: TargetKind::Crate, scale: 1.0 });
                         goal = Some(xy(c.pos));
-                    } else if hp_frac > self.prm.farm_hp {
+                    } else if hp_frac > if sprint { self.prm.farm_hp.max(0.6) } else { self.prm.farm_hp } {
+                        let npc_r = if sprint { self.prm.open_npc.max(80.0) } else { 80.0 };
                         if let Some(n) = obs
                             .mechs
                             .iter()
-                            .filter(|m| m.kind == "npc" && hdist(m.pos, pos) < 80.0 && dist2(xy(m.pos), gc) < gr)
+                            .filter(|m| m.kind == "npc" && hdist(m.pos, pos) < npc_r && dist2(xy(m.pos), gc) < gr)
                             .min_by(|a, b| hdist(a.pos, pos).partial_cmp(&hdist(b.pos, pos)).unwrap())
                         {
                             mode = Mode::Farm;
@@ -2005,7 +2140,10 @@ impl Brain {
             }
         }
 
-        if mode == Mode::Roam {
+        let home_goal = if mode == Mode::Roam && sprint && self.prm.sound_home > 0.5 { self.open_goal(obs.t, p2, gc, gr) } else { None };
+        if let Some(g) = home_goal {
+            mv = self.goto(p2, g);
+        } else if mode == Mode::Roam {
             let need = match self.roam_goal {
                 None => true,
                 Some((g, t0)) => dist2(g, p2) < 6.0 || obs.t - t0 > 30.0 || dist2(g, gc) > gr,
