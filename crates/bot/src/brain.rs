@@ -401,7 +401,7 @@ impl Default for Params {
             nlr: 2.0,
             nlr_t: 90.0,
             nlr_d: 35.0,
-            dd: 0.0,
+            dd: 1.0,
             dd_in: 3.0,
             dd_out: 4.5,
             dd_alive: 10.0,
