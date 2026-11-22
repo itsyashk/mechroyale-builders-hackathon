@@ -390,7 +390,7 @@ impl Default for Params {
             noret: 1.0,
             memt: 0.0,
             nlr: 2.0,
-            arc: 0.0,
+            arc: 1.0,
             arc_w: 0.3,
             arc_mv: 0.8,
             arc_turn: 120.0,
