@@ -153,6 +153,7 @@ pub struct Brain {
     last_dmg_t: f32,
     last_deal_t: f32,
     dmg_log: Vec<(f32, f32, Option<i64>, f32)>, // t, bearing, by, amount
+    rear_log: Vec<(f32, f32, i64, f32)>, // rear hits only: t, bearing, by, amount
     retreating: bool,
     cover_goal: Option<([f32; 2], f32)>,
     target_id: Option<i64>,
@@ -310,6 +311,12 @@ pub struct Params {
     /// Remember out-of-view enemies for this many s (cover choice, threat estimate).
     pub memt: f32,
     pub nlr: f32,
+    /// 1 = front-arc guard (keep threats in the torso front arc, kill the flanker first).
+    pub arc: f32,
+    pub arc_w: f32,
+    pub arc_mv: f32,
+    pub arc_turn: f32,
+    pub arc_ang: f32,
     pub nlr_t: f32,
     pub nlr_d: f32,
 }
@@ -383,6 +390,11 @@ impl Default for Params {
             noret: 1.0,
             memt: 0.0,
             nlr: 2.0,
+            arc: 0.0,
+            arc_w: 0.3,
+            arc_mv: 0.8,
+            arc_turn: 120.0,
+            arc_ang: 80.0,
             nlr_t: 90.0,
             nlr_d: 35.0,
         }
@@ -464,6 +476,11 @@ impl Params {
                     "noret" => p.noret = x,
                     "memt" => p.memt = x,
                     "nlr" => p.nlr = x,
+                    "arc" => p.arc = x,
+                    "arc_w" => p.arc_w = x,
+                    "arc_mv" => p.arc_mv = x,
+                    "arc_turn" => p.arc_turn = x,
+                    "arc_ang" => p.arc_ang = x,
                     "nlr_t" => p.nlr_t = x,
                     "nlr_d" => p.nlr_d = x,
                     _ => eprintln!("unknown param {k}"),
@@ -595,6 +612,7 @@ impl Brain {
             last_dmg_t: -100.0,
             last_deal_t: -100.0,
             dmg_log: Vec::new(),
+            rear_log: Vec::new(),
             retreating: false,
             cover_goal: None,
             target_id: None,
@@ -1207,6 +1225,11 @@ impl Brain {
                     }
                     if let Some(b) = e.bearing {
                         self.dmg_log.push((obs.t, b, e.by, e.amount.unwrap_or(0.0)));
+                        if e.rear.unwrap_or(false) {
+                            if let Some(by) = e.by {
+                                self.rear_log.push((obs.t, b, by, e.amount.unwrap_or(0.0)));
+                            }
+                        }
                     }
                 }
                 "hit" => {
@@ -1248,6 +1271,7 @@ impl Brain {
             }
         }
         self.dmg_log.retain(|d| obs.t - d.0 < 6.0);
+        self.rear_log.retain(|d| obs.t - d.0 < 3.0);
         for m in obs.mechs.iter().filter(|m| m.is_mech() && m.id != me.id) {
             let first_t = self.tracks.get(&m.id).map(|t| t.first_t).unwrap_or(obs.t);
             let charge_t0 = self.tracks.get(&m.id).filter(|t| t.charging && t.charge_t0 >= 0.0 && obs.t - t.seen_t < 0.3).map(|t| t.charge_t0).unwrap_or(obs.t);
@@ -1338,6 +1362,42 @@ impl Brain {
         let dmg_by = |id: i64, log: &Vec<(f32, f32, Option<i64>, f32)>| -> f32 {
             log.iter().filter(|d| obs.t - d.0 < 2.0 && d.2 == Some(id)).map(|d| d.3).sum()
         };
+        // Front-arc guard: weighted threat list (visible + tracks seen < 3 s, within 130 m).
+        let mut arc_thr: Vec<(i64, [f32; 2], f32)> = vec![];
+        let mut arc_rear_id: Option<i64> = None;
+        if self.prm.arc > 0.0 {
+            let wf = |d: f32, gunish: bool, hit: bool| -> f32 {
+                (1.0 - d / 130.0).max(0.1) * if gunish { 1.0 } else { 0.6 } * if hit { 1.5 } else { 1.0 }
+            };
+            for m in &enemies {
+                let d = hdist(m.pos, pos);
+                if d < 130.0 {
+                    let hit = attackers.contains(&m.id);
+                    arc_thr.push((m.id, xy(m.pos), wf(d, m.has("gun") || m.has("laser"), hit)));
+                }
+            }
+            for (id, tr) in &self.tracks {
+                if obs.t - tr.seen_t >= 3.0 || enemies.iter().any(|m| m.id == *id) {
+                    continue;
+                }
+                let d = hdist(tr.pos, pos);
+                if d < 130.0 {
+                    let hit = attackers.contains(id);
+                    arc_thr.push((*id, xy(tr.pos), wf(d, tr.weapons.iter().any(|w| w == "gun" || w == "laser"), hit)));
+                }
+            }
+            let ang = self.prm.arc_ang.to_radians();
+            let mut bw = 0.0;
+            for t in &arc_thr {
+                if wrap(yaw_to(xy(pos), t.1) - me.aim[0]).abs() > ang && t.2 > bw {
+                    bw = t.2;
+                    arc_rear_id = Some(t.0);
+                }
+            }
+        }
+        let rear_by = |id: i64, log: &Vec<(f32, f32, i64, f32)>| -> f32 {
+            log.iter().filter(|d| obs.t - d.0 < 1.0 && d.2 == id).map(|d| d.3).sum()
+        };
         let mut best_t: Option<(f32, &Mech, bool)> = None;
         for m in &enemies {
             let scale = 1.0 + 0.05 * m.cubes.unwrap_or(0) as f32;
@@ -1355,6 +1415,14 @@ impl Brain {
             s -= dmg_by(m.id, &self.dmg_log) * 0.25;
             if Some(m.id) == self.target_id {
                 s -= 30.0;
+            }
+            if self.prm.arc > 0.0 {
+                if Some(m.id) == arc_rear_id {
+                    s -= self.prm.arc_w * 40.0;
+                }
+                if rear_by(m.id, &self.rear_log) >= self.prm.arc_turn {
+                    s -= self.prm.arc_w * 120.0;
+                }
             }
             // Laser cook-off: +60% to mortar carriers.
             if self.prm.lcook > 0.0 && m.has("mortar") && me.weapons.iter().flatten().any(|w| w.kind == "laser") {
@@ -2118,6 +2186,52 @@ impl Brain {
             }
         }
 
+        // Front-arc guard: hits from outside the torso front arc do x1.5. When threats surround
+        // us, step to the side that puts the most (damage-weighted) threats in front of the aim.
+        if self.prm.arc > 0.0 && mode == Mode::Fight && !kiting && self.dodge_goal.is_none() && arc_thr.len() >= 2 {
+            if let Some(tg) = tgt.as_ref().filter(|t| matches!(t.kind, TargetKind::Mech)) {
+                let tp = xy(tg.pos);
+                let ang = self.prm.arc_ang.to_radians();
+                let expo = |p: [f32; 2]| -> f32 {
+                    let a = yaw_to(p, tp);
+                    arc_thr.iter().filter(|t| wrap(yaw_to(p, t.1) - a).abs() > ang).map(|t| t.2).sum::<f32>()
+                };
+                let cur = expo(p2);
+                let mut bs: Vec<f32> = arc_thr.iter().map(|t| yaw_to(p2, t.1)).collect();
+                bs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let mut gap = 2.0 * PI - (bs[bs.len() - 1] - bs[0]);
+                for i in 1..bs.len() {
+                    gap = gap.max(bs[i] - bs[i - 1]);
+                }
+                let span = 2.0 * PI - gap;
+                if cur > 0.05 && span > 160f32.to_radians() {
+                    let mut best: Option<(f32, [f32; 2])> = None;
+                    for k in 0..16 {
+                        let a = k as f32 * 2.0 * PI / 16.0;
+                        let dv = [a.cos(), a.sin()];
+                        let p4 = [p2[0] + dv[0] * 4.0, p2[1] + dv[1] * 4.0];
+                        let p12 = [p2[0] + dv[0] * 12.0, p2[1] + dv[1] * 12.0];
+                        if !self.nav.walkable_at(p4[0], p4[1]) || !self.nav.walkable_at(p12[0], p12[1]) || !self.nav.line_walkable(p2, p12) {
+                            continue;
+                        }
+                        let mut sc = expo(p12);
+                        if dist2(p12, gc) > gr {
+                            sc += 0.3;
+                        }
+                        sc -= 0.02 * (dv[0] * mv[0] + dv[1] * mv[1]);
+                        if best.map(|b| sc < b.0).unwrap_or(true) {
+                            best = Some((sc, dv));
+                        }
+                    }
+                    if let Some((sc, dv)) = best {
+                        if sc < cur - 0.1 {
+                            mv = unit2([mv[0] + dv[0] * self.prm.arc_mv, mv[1] + dv[1] * self.prm.arc_mv]);
+                        }
+                    }
+                }
+            }
+        }
+
         // Laser juke: house lasers aim at where we were a reaction time ago plus our velocity
         // then; a hard lateral reversal shortly before release makes that prediction miss.
         if self.prm.lj > 0.0 && matches!(mode, Mode::Fight | Mode::Cover) && (self.dodge_goal.is_none() || self.prm.lj > 1.5 || mode == Mode::Cover) {
@@ -2300,6 +2414,26 @@ impl Brain {
             }
             if let Some(w) = per.iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()) {
                 if w.1 >= self.prm.turn_unseen {
+                    aim = Some([w.2, 0.0]);
+                }
+            }
+        }
+        if self.prm.arc > 0.0 && tgt_hp > 300.0 && self.prm.turn_unseen <= 0.0 {
+            let mut per: Vec<(i64, f32, f32)> = vec![];
+            for d in self.rear_log.iter().filter(|d| obs.t - d.0 < 1.0) {
+                if enemies.iter().any(|m| m.id == d.2) {
+                    continue;
+                }
+                match per.iter_mut().find(|p| p.0 == d.2) {
+                    Some(p) => {
+                        p.1 += d.3;
+                        p.2 = d.1;
+                    }
+                    None => per.push((d.2, d.3, d.1)),
+                }
+            }
+            if let Some(w) = per.iter().filter(|p| p.0 < 100).max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()) {
+                if w.1 >= self.prm.arc_turn {
                     aim = Some([w.2, 0.0]);
                 }
             }
