@@ -389,7 +389,7 @@ impl Default for Params {
             nlr: 2.0,
             nlr_t: 90.0,
             nlr_d: 35.0,
-            dsk: 0.0,
+            dsk: 1.0,
             dsk_reach: 120.0,
         }
     }
