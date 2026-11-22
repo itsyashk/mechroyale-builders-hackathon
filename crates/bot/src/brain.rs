@@ -355,7 +355,7 @@ impl Default for Params {
             hold_r: 70.0,
             leash: 10.0,
             kite_light: 55.0,
-            drop_dash: 0.0,
+            drop_dash: 1.0,
             drop_eta_slack: 6.0,
             drop_range: 260.0,
             st_lo: 0.45,
