@@ -149,6 +149,13 @@ stuck on a building corner (it does not path).
 | `v1` (default) | Original guess: squad, first hunter at 45 s, angular aim error, non-hunters retaliate only within 40-55 m | ~3.5-4.0 / 0.54 (real board: 4.15-4.52 / 1.15) |
 | `v2` | Fitted to `kit/check/stream.jsonl.gz`: accurate leading aim at 150 m, hard jinking, laser at spawn (`SIM_SPAWN_LASER`), hunting from t=0 (`SIM_FIRST_HUNT`), `SIM_ENGAGE_MUL` | ~1.1-1.4 / 0.0: far too lethal |
 | `v3` | v1, plus aim error capped past 40 m, retaliation at any range, jinking every 0.25-0.6 s | ~2.6-3.1 / 0.34 |
+| `v4` | Calibrated to other teams' real-practice measurements: range-dependent metre aim error (`SIM_V4_C0`, `SIM_V4_K`), sharp lead, laser aim x0.35, standoff band 55-95 m (`SIM_V4_LO/HI`), first hunter at 5 s (`SIM_V4_FIRST`), +0.34 hunters per fallen mate (`SIM_V4_PER_KILL`), everyone at 360 s (`SIM_V4_ALL`), 4 m intel refreshed every 1 s, a bot we hurt hunts us for 10 s (`SIM_V4_AGGRO_S`, `SIM_V4_ALERT_R`), no lasers at spawn (`SIM_V4_LASER_TIER`; lasers for all at spawn scored 0.04-1.3) | ~2.5-4.1 / 0.42: about 1.0 low; ranks our commits no better than v1 |
+
+`SIM_HITSTATS=1` prints house-bot gun/laser hit rates against the external bot by range bin.
+Against our dodging bots the house gun hits ~75% / 50% / 30% / 15% (<40 / 40-80 / 80-120 /
+120-160 m) even with perfect explicit aim; against the non-strafing kit example bot, perfect aim
+gives ~90 / 80 / 55 / 54%, close to the real measurements (90 / - / 61 / 36%). Projectile flight
+time against a moving target causes most of the drop with range.
 
 The recorded stream is not a practice match: three house bots die by t=25 s while the example
 bot scores no kills, which cannot happen when the squad never fights itself. A free-for-all does

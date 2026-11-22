@@ -109,18 +109,18 @@ pub fn v4() -> &'static V4 {
     static V: std::sync::OnceLock<V4> = std::sync::OnceLock::new();
     V.get_or_init(|| V4 {
         first_hunt: env_f("SIM_V4_FIRST", 5.0),
-        all_hunt: env_f("SIM_V4_ALL", 300.0),
+        all_hunt: env_f("SIM_V4_ALL", 360.0),
         per_min: env_f("SIM_V4_PERMIN", 0.0),
-        per_kill: env_f("SIM_V4_PER_KILL", 1.0),
+        per_kill: env_f("SIM_V4_PER_KILL", 0.34),
         c0: env_f("SIM_V4_C0", 1.4),
         k: env_f("SIM_V4_K", 2.9e-4),
         laser_mul: env_f("SIM_V4_LASERMUL", 0.35),
         lo: env_f("SIM_V4_LO", 55.0),
         hi: env_f("SIM_V4_HI", 95.0),
-        aggro_s: env_f("SIM_V4_AGGRO_S", 30.0),
-        alert_r: env_f("SIM_V4_ALERT_R", 80.0),
+        aggro_s: env_f("SIM_V4_AGGRO_S", 10.0),
+        alert_r: env_f("SIM_V4_ALERT_R", 0.0),
         intel_noise: env_f("SIM_V4_INTEL_NOISE", 4.0),
-        laser_tier: env_f("SIM_V4_LASER_TIER", 0.0) as usize,
+        laser_tier: env_f("SIM_V4_LASER_TIER", 4.0) as usize,
         engage_mul: env_f("SIM_V4_ENGAGE_MUL", 1.0),
     })
 }
