@@ -412,7 +412,7 @@ impl Default for Params {
             nlr: 2.0,
             nlr_t: 90.0,
             nlr_d: 35.0,
-            lane: 0.0,
+            lane: 1.0,
             lane_n: 3.0,
             lane_idle: 6.0,
             lane_r: 50.0,
