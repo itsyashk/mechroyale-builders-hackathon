@@ -44,6 +44,14 @@ struct Track {
     aerr: f32,
 }
 
+/// Inferred gun magazine state of an enemy (reload-window rush).
+#[derive(Clone, Debug, Default)]
+struct GunSt {
+    shots: u32,
+    last_shot: f32,
+    reload_until: f32,
+}
+
 /// Per-opponent engagement record (MECHBOT_DUEL instrumentation).
 #[derive(Clone, Debug, Default)]
 struct Duel {
@@ -199,6 +207,13 @@ pub struct Brain {
     dth_nshoot: usize,
     dth_myw: String,
     dth_cubes: i32,
+    /// Reload-window rush state.
+    rw_gun: HashMap<i64, GunSt>,
+    rw_seen: HashMap<i64, f32>,
+    rw_prev: bool,
+    rw_ap_prev: bool,
+    /// attributed, ambiguous-skipped, windows set, windows cancelled by a shot, rush starts, rush ticks, rush dmg, approach ticks, approach dmg, unattributed
+    rw_stat: [f32; 10],
     // config numbers
     pickup_radius: f32,
     cube_radius: f32,
@@ -312,6 +327,16 @@ pub struct Params {
     pub nlr: f32,
     pub nlr_t: f32,
     pub nlr_d: f32,
+    /// 1 = reload-window rush: boost into close range while a gun-only target is inferred to be reloading.
+    pub rwr: f32,
+    /// Gap rule: a pause >0.6 s after this many counted shots is taken as a reload.
+    pub rwr_burst: f32,
+    /// Minimum remaining reload (s) to start a rush.
+    pub rwr_rem: f32,
+    /// Single-hunter gate: more than one enemy within this many m disables attribution.
+    pub rwr_gate: f32,
+    /// No other armed enemy within this many m may be firing.
+    pub rwr_other: f32,
 }
 
 impl Default for Params {
@@ -385,6 +410,11 @@ impl Default for Params {
             nlr: 2.0,
             nlr_t: 90.0,
             nlr_d: 35.0,
+            rwr: 0.0,
+            rwr_burst: 8.0,
+            rwr_rem: 0.8,
+            rwr_gate: 150.0,
+            rwr_other: 120.0,
         }
     }
 }
@@ -466,6 +496,11 @@ impl Params {
                     "nlr" => p.nlr = x,
                     "nlr_t" => p.nlr_t = x,
                     "nlr_d" => p.nlr_d = x,
+                    "rwr" => p.rwr = x,
+                    "rwr_burst" => p.rwr_burst = x,
+                    "rwr_rem" => p.rwr_rem = x,
+                    "rwr_gate" => p.rwr_gate = x,
+                    "rwr_other" => p.rwr_other = x,
                     _ => eprintln!("unknown param {k}"),
                 }
             }
@@ -635,6 +670,11 @@ impl Brain {
             dth_nshoot: 0,
             dth_myw: String::new(),
             dth_cubes: 0,
+            rw_gun: HashMap::new(),
+            rw_seen: HashMap::new(),
+            rw_prev: false,
+            rw_ap_prev: false,
+            rw_stat: [0.0; 10],
             duel_on: std::env::var("MECHBOT_DUEL").is_ok(),
             debug: std::env::var("MECHBOT_DEBUG").is_ok(),
             gstat: [0; 7],
@@ -770,6 +810,13 @@ impl Brain {
 
     pub fn log_end(&self, raw: &str) {
         eprintln!("end: {raw} gunstat[mech_ticks,fire,nolos,range,ammo/reload,aim,hold]={:?} sniper[peek,hide,nopair,_]={:?}", self.gstat, self.sn_stat);
+        if self.prm.rwr > 0.0 && (self.debug || self.duel_on || self.ws.on) {
+            let r = &self.rw_stat;
+            eprintln!(
+                "rwr: attr={:.0} amb={:.0} windows={:.0} cancelled={:.0} rushes={:.0} rush_ticks={:.0} rush_dmg={:.0} appr_ticks={:.0} appr_dmg={:.0} unattr={:.0}",
+                r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9]
+            );
+        }
         if self.ws.on {
             let w = &self.ws;
             eprintln!(
@@ -1182,6 +1229,96 @@ impl Brain {
 
     // ------------------------------------------------------------------ main ----------
 
+    /// Infer enemy gun magazine / reload state from visible bullets.
+    fn rwr_update(&mut self, obs: &Obs) {
+        let t = obs.t;
+        let pos = obs.me.pos;
+        self.rw_seen.retain(|_, ts| t - *ts < 2.0);
+        {
+            let tracks = &self.tracks;
+            self.rw_gun.retain(|id, _| tracks.contains_key(id));
+        }
+        let vis: Vec<&Mech> = obs.mechs.iter().filter(|m| m.is_mech() && m.id != obs.me.id).collect();
+        let near = vis.iter().filter(|m| hdist(m.pos, pos) < self.prm.rwr_gate).count();
+        for p in obs.projectiles.iter().filter(|p| p.kind == "gun") {
+            if self.rw_seen.insert(p.id, t).is_some() {
+                continue;
+            }
+            let v = p.vel;
+            let sp2 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+            if sp2 < 1.0 {
+                continue;
+            }
+            let pyaw = v[1].atan2(v[0]);
+            let mut cands: Vec<(i64, f32)> = Vec::new();
+            for m in &vis {
+                let (ay, ap) = (m.aim[0], m.aim[1]);
+                let dir = [ap.cos() * ay.cos(), ap.cos() * ay.sin(), ap.sin()];
+                let o = [m.pos[0] + dir[0] * 3.0, m.pos[1] + dir[1] * 3.0, m.pos[2] + 7.0 + dir[2] * 3.0];
+                let tc = ((o[0] - p.pos[0]) * v[0] + (o[1] - p.pos[1]) * v[1] + (o[2] - p.pos[2]) * v[2]) / sp2;
+                if !(-0.25..=0.05).contains(&tc) {
+                    continue;
+                }
+                let ot = [o[0] + m.vel[0] * tc, o[1] + m.vel[1] * tc, o[2] + m.vel[2] * tc];
+                let cl = [p.pos[0] + v[0] * tc, p.pos[1] + v[1] * tc, p.pos[2] + v[2] * tc];
+                let dd = ((cl[0] - ot[0]).powi(2) + (cl[1] - ot[1]).powi(2) + (cl[2] - ot[2]).powi(2)).sqrt();
+                if dd < 5.0 && wrap(pyaw - ay).abs() < 0.5 {
+                    cands.push((m.id, t + tc));
+                }
+            }
+            if cands.is_empty() {
+                self.rw_stat[9] += 1.0;
+                continue;
+            }
+            if near > 1 || cands.len() > 1 {
+                self.rw_stat[1] += 1.0;
+                for (id, _) in &cands {
+                    if let Some(g) = self.rw_gun.get_mut(id) {
+                        *g = GunSt::default();
+                    }
+                }
+                continue;
+            }
+            let (id, ts) = cands[0];
+            let g = self.rw_gun.entry(id).or_default();
+            self.rw_stat[0] += 1.0;
+            if g.reload_until > 0.0 {
+                if ts < g.reload_until - 0.3 {
+                    // It fired during the supposed reload: the window was wrong.
+                    self.rw_stat[3] += 1.0;
+                    *g = GunSt::default();
+                } else {
+                    g.reload_until = 0.0;
+                    g.shots = 0;
+                }
+            }
+            if g.shots > 0 && ts - g.last_shot > 2.6 {
+                // Long pause: it may have reloaded early; the count is unknown.
+                g.shots = 0;
+            }
+            g.shots += 1;
+            g.last_shot = ts;
+            if g.shots >= 12 {
+                g.reload_until = ts + 2.4;
+                g.shots = 0;
+                self.rw_stat[2] += 1.0;
+            }
+        }
+        let burst = self.prm.rwr_burst as u32;
+        for m in &vis {
+            if let Some(g) = self.rw_gun.get_mut(&m.id) {
+                if g.reload_until > 0.0 && t > g.reload_until + 0.1 {
+                    g.reload_until = 0.0;
+                    g.shots = 0;
+                } else if g.reload_until <= 0.0 && g.shots >= burst && t - g.last_shot > 0.6 && t - g.last_shot < 2.0 {
+                    g.reload_until = g.last_shot + 2.4;
+                    g.shots = 0;
+                    self.rw_stat[2] += 1.0;
+                }
+            }
+        }
+    }
+
     pub fn act(&mut self, obs: &Obs) -> Action {
         self.ticks += 1;
         self.t = obs.t;
@@ -1283,6 +1420,9 @@ impl Brain {
             );
         }
         self.tracks.retain(|_, t| obs.t - t.seen_t < 20.0);
+        if self.prm.rwr > 0.0 {
+            self.rwr_update(obs);
+        }
         for p in &obs.pickups {
             self.pickups.insert(p.id, (p.kind.clone(), p.pos, obs.t));
         }
@@ -1850,6 +1990,48 @@ impl Brain {
             }
         }
 
+        // Reload-window rush: the (single) hunter has emptied its magazine, so close the standoff
+        // band now at boost speed, straight at it.
+        let mut rushing = false;
+        if self.prm.rwr > 0.0 && mode == Mode::Fight {
+            if let Some((m, shootable)) = &target_mech {
+                let d = hdist(m.pos, pos);
+                let stop = if have_light { self.prm.light_hi - 5.0 } else { self.prm.gun_lo };
+                let rem = self.rw_gun.get(&m.id).map(|g| g.reload_until - obs.t).unwrap_or(-1.0);
+                let gun_only = !m.weapons.is_empty() && m.weapons.iter().all(|w| w == "gun");
+                let others_ok = !self.tracks.iter().any(|(id, t)| {
+                    *id != m.id
+                        && obs.t - t.seen_t < 2.0
+                        && hdist(t.pos, pos) < self.prm.rwr_other
+                        && (t.charging
+                            || t.weapons.iter().any(|w| w != "gun") && hdist(t.pos, pos) < 100.0
+                            || self.rw_gun.get(id).map(|g| obs.t - g.last_shot < 1.2 && g.reload_until <= obs.t).unwrap_or(false))
+                });
+                let ready = *shootable && gun_only && others_ok && d > stop + 3.0 && me.energy > 40.0 && (self.boosting || self.rw_prev) && me.grounded;
+                if ready && (rem > self.prm.rwr_rem || self.rw_prev && rem > 0.15) {
+                    let to = unit2([m.pos[0] - p2[0], m.pos[1] - p2[1]]);
+                    mv = if self.nav.walkable_at(p2[0] + to[0] * 5.0, p2[1] + to[1] * 5.0) { to } else { self.goto(p2, xy(m.pos)) };
+                    want_boost = true;
+                    rushing = true;
+                }
+            }
+        }
+        {
+            let dmg: f32 = obs.events.iter().filter(|e| e.kind == "damaged" && e.by.map(|b| b < 100).unwrap_or(false)).map(|e| e.amount.unwrap_or(0.0)).sum();
+            if self.rw_prev {
+                self.rw_stat[5] += 1.0;
+                self.rw_stat[6] += dmg;
+            } else if self.rw_ap_prev {
+                self.rw_stat[7] += 1.0;
+                self.rw_stat[8] += dmg;
+            }
+            if rushing && !self.rw_prev {
+                self.rw_stat[4] += 1.0;
+            }
+            self.rw_prev = rushing;
+            self.rw_ap_prev = !rushing && mode == Mode::Fight && tgt_d > self.prm.gun_lo + 3.0 && tgt_d < 140.0;
+        }
+
         // Tactical position: with several enemies around, fight from a spot that sees the
         // target but is hidden from the others.
         if mode == Mode::Fight && self.prm.tactic > 0.5 && threat_eyes.len() >= 2 {
@@ -2208,7 +2390,7 @@ impl Brain {
 
         // ---- boost with energy hysteresis (keep a reserve for lightning)
         let reserve = if have_light { 45.0 } else { 12.0 };
-        if have_light && mode == Mode::Fight && tgt_d < 50.0 && self.prm.fboost < 0.5 && !kiting {
+        if have_light && mode == Mode::Fight && tgt_d < 50.0 && self.prm.fboost < 0.5 && !kiting && !rushing {
             want_boost = false;
         }
         if self.boosting {
