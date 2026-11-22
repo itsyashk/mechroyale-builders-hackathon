@@ -393,7 +393,7 @@ impl Default for Params {
             nlr: 2.0,
             nlr_t: 90.0,
             nlr_d: 35.0,
-            shd: 0.0,
+            shd: 1.0,
             shd_ring: 36.0,
             shd_hand: 40.0,
             shd_cap: 1.6,
