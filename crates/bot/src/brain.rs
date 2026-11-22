@@ -163,6 +163,7 @@ pub struct Brain {
     debug: bool,
     debug_every: u64,
     gstat: [u32; 7],
+    aps_prev: Option<(i64, f32, f32)>, // target id, t, bearing yaw
     dodge_goal: Option<[f32; 2]>,
     dodge_check_t: f32,
     dodges: u32,
@@ -312,6 +313,8 @@ pub struct Params {
     pub nlr: f32,
     pub nlr_t: f32,
     pub nlr_d: f32,
+    /// Slew-aware gun trigger + angular-velocity lead (1 = both, 2 = trigger only).
+    pub aps: f32,
 }
 
 impl Default for Params {
@@ -385,6 +388,7 @@ impl Default for Params {
             nlr: 2.0,
             nlr_t: 90.0,
             nlr_d: 35.0,
+            aps: 0.0,
         }
     }
 }
@@ -466,6 +470,7 @@ impl Params {
                     "nlr" => p.nlr = x,
                     "nlr_t" => p.nlr_t = x,
                     "nlr_d" => p.nlr_d = x,
+                    "aps" => p.aps = x,
                     _ => eprintln!("unknown param {k}"),
                 }
             }
@@ -638,6 +643,7 @@ impl Brain {
             duel_on: std::env::var("MECHBOT_DUEL").is_ok(),
             debug: std::env::var("MECHBOT_DEBUG").is_ok(),
             gstat: [0; 7],
+            aps_prev: None,
             debug_every: std::env::var("MECHBOT_DEBUG").ok().and_then(|v| v.parse().ok()).unwrap_or(10).max(1),
         })
     }
@@ -2433,6 +2439,20 @@ impl Brain {
             aim_at(muzzle, q)
         });
         let direct = aim_at(muzzle, add(center, scale(tg.vel, self.prm.llead)));
+        let mut gun_aim = gun_aim;
+        if self.prm.aps > 0.5 {
+            let by = yaw_to(xy(muzzle), xy(center));
+            if self.prm.aps < 1.5 {
+                if let (Some(ga), Some((pid, pt, py))) = (gun_aim.as_mut(), self.aps_prev) {
+                    let dt = obs.t - pt;
+                    if pid == tg.id && dt > 0.04 && dt < 0.3 {
+                        let rate = wrap(by - py) / dt;
+                        ga[0] = wrap(ga[0] + (rate * 0.05).clamp(-0.03, 0.03));
+                    }
+                }
+            }
+            self.aps_prev = Some((tg.id, obs.t, by));
+        }
         let mut aim = gun_aim.unwrap_or(direct);
 
         let tol_yaw = (radius * 0.75 / d.max(1.0)).atan() + 0.006;
@@ -2484,11 +2504,29 @@ impl Brain {
             let range = gw.stat("range", 230.0);
             let ammo = gw.ammo.unwrap_or(1.0);
             let reloading = gw.reload.unwrap_or(0.0) > 0.0;
-            let ok_aim = if laser.map(|li| fire[li]).unwrap_or(false) {
+            let mut ok_aim = if laser.map(|li| fire[li]).unwrap_or(false) {
                 aligned(ga) || aligned(direct) && (d < 60.0 || self.prm.chg_gun > 1.5)
             } else {
                 aligned(ga)
             };
+            if self.prm.aps > 0.5 && !ok_aim {
+                // Slew-aware gate: where will the muzzle be after the next 0.05 s of slew?
+                let tr = statf(me, "turn_rate", 4.0) * 0.05;
+                let pr = statf(me, "pitch_rate", 3.0) * 0.05;
+                let ey = wrap(aim[0] - cur_aim[0]);
+                let ep = aim[1] - cur_aim[1];
+                let pa = [wrap(cur_aim[0] + ey.clamp(-tr, tr)), cur_aim[1] + ep.clamp(-pr, pr)];
+                let near = |a: [f32; 2], f: f32| wrap(pa[0] - a[0]).abs() < tol_yaw * f && (pa[1] - a[1]).abs() < tol_pitch * f;
+                if near(ga, 1.15) {
+                    ok_aim = true;
+                } else if wrap(aim[0] - ga[0]).abs() < 0.01
+                    && (aim[1] - ga[1]).abs() < 0.01
+                    && wrap(cur_aim[0] - ga[0]).abs() < 2.5 * tol_yaw
+                    && (cur_aim[1] - ga[1]).abs() < 2.5 * tol_pitch
+                {
+                    ok_aim = true;
+                }
+            }
             if los && d < range && ammo > 0.0 && !reloading && ok_aim && allow {
                 fire[gi] = true;
             }
