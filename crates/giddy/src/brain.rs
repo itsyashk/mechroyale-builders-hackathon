@@ -122,6 +122,10 @@ pub struct Params {
     pub speed_up: bool,
     pub backstab: f64,
     pub lethal_k: f64,
+    pub lose_t: f64,
+    pub lose_h2: f64,
+    pub lose_h3: f64,
+    pub lose_r: f64,
 }
 
 /// Baked-in tuning overrides ("k=v,k=v"), applied on top of both the base and the
@@ -190,6 +194,10 @@ pub fn apply_overrides(p: &mut Params) {
             "speed_up" => p.speed_up = x > 0.5,
             "backstab" => p.backstab = x,
             "lethal_k" => p.lethal_k = x,
+            "lose_t" => p.lose_t = x,
+            "lose_h2" => p.lose_h2 = x,
+            "lose_h3" => p.lose_h3 = x,
+            "lose_r" => p.lose_r = x,
             _ => {}
         }
     }
@@ -217,6 +225,10 @@ pub fn default_params() -> Params {
         crowd_hide: true,
         practice: true,
         end_ghost: 140.0,
+        lose_t: 1.5,
+        lose_h2: 0.55,
+        lose_h3: 0.8,
+        lose_r: 160.0,
         ..Default::default()
     };
     // per-slot table from bot.py (unset = 140)
@@ -929,11 +941,11 @@ impl Brain {
         if self.p.lose_rule {
             let mut near = 0;
             for t in &seen {
-                if t.seen == now && t.dist < 160.0 {
+                if t.seen == now && t.dist < self.p.lose_r {
                     near += 1;
                 }
             }
-            let mut losing = (near >= 2 && hp_frac < 0.55) || (near >= 3 && hp_frac < 0.8);
+            let mut losing = (near >= 2 && hp_frac < self.p.lose_h2) || (near >= 3 && hp_frac < self.p.lose_h3);
             if let Some(t) = tgt {
                 let tf = t.hp / fmax(1.0, t.max_hp);
                 if hp_frac < 0.35 && tf > hp_frac + 0.1 {
@@ -946,7 +958,7 @@ impl Brain {
             if losing {
                 self.lose_at = now;
             }
-            self.retreat = now - self.lose_at < 1.5 && self.lose_at > 0.0;
+            self.retreat = now - self.lose_at < self.p.lose_t && self.lose_at > 0.0;
         }
 
         let mut exposed = false;
