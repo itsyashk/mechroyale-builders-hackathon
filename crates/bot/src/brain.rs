@@ -177,6 +177,7 @@ pub struct Brain {
     allow_escape: bool,
     escape_goal: [f32; 2],
     last_ttd: f32,
+    pulse_until: f32,
     sn_pair: Option<([f32; 2], [f32; 2])>,
     sn_t: f32,
     sn_tpos: [f32; 2],
@@ -317,6 +318,8 @@ pub struct Params {
     pub nlr_d: f32,
     /// Slew-aware gun trigger + angular-velocity lead (1 = both, 2 = trigger only).
     pub aps: f32,
+    /// >0: with noret, short losing-retreat pulses of this many s (giddy-style losing rule).
+    pub pulse: f32,
 }
 
 impl Default for Params {
@@ -391,6 +394,7 @@ impl Default for Params {
             nlr_t: 90.0,
             nlr_d: 35.0,
             aps: 1.0,
+            pulse: 0.0,
         }
     }
 }
@@ -473,6 +477,7 @@ impl Params {
                     "nlr_t" => p.nlr_t = x,
                     "nlr_d" => p.nlr_d = x,
                     "aps" => p.aps = x,
+                    "pulse" => p.pulse = x,
                     _ => eprintln!("unknown param {k}"),
                 }
             }
@@ -622,6 +627,7 @@ impl Brain {
             allow_escape: true,
             escape_goal: [0.0, 0.0],
             last_ttd: 0.0,
+            pulse_until: -100.0,
             sn_pair: None,
             sn_t: -100.0,
             sn_tpos: [0.0, 0.0],
@@ -1497,7 +1503,8 @@ impl Brain {
             let safe = hp_frac > 0.8 || enemies.is_empty() && obs.t - self.last_dmg_t > 10.0;
             let cornered = tgt_d < 30.0 && ttk < ttd * 0.8 || self.prm.corner_d > 0.0 && tgt_d < self.prm.corner_d && n_shooting <= 1;
             let winning = ttk < ttd * 0.9 && n_shooting <= 1 || ttk < 2.0 && ttk < ttd;
-            if safe || cornered || winning {
+            let pulse_over = self.prm.pulse > 0.0 && obs.t > self.pulse_until;
+            if safe || cornered || winning || pulse_over {
                 self.retreating = false;
             }
         } else if target_mech.is_some() {
@@ -1507,6 +1514,15 @@ impl Brain {
             if (losing || low) && !pinned && self.prm.noret < 0.5 {
                 self.retreating = true;
                 self.cover_goal = None;
+            }
+            if self.prm.pulse > 0.0 && obs.t > self.pulse_until + self.prm.pulse {
+                let g_losing = n_shooting >= 2 && hp_frac < 0.55 || n_shooting >= 3 && hp_frac < 0.8 || hp_frac < 0.35 && ttk > ttd;
+                let finish = ttk < 1.2 || tgt_hp < 250.0;
+                if g_losing && !finish {
+                    self.retreating = true;
+                    self.cover_goal = None;
+                    self.pulse_until = obs.t + self.prm.pulse;
+                }
             }
         }
         // A laser sniper we can't answer: deny it line of sight and make it come to us.
