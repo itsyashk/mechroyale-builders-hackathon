@@ -1,4 +1,5 @@
-# mechfight/1 bot: Rust decision logic + Zig geometry kernels (LOS raycasts, A*).
+# mechfight/1 bot: giddybot (Rust port of the MIT-licensed giddy Go bot, Zig terrain raycast).
+# mechbot (our own Rust + Zig bot) is still built so both stay buildable.
 # Toolchains are pinned so finalist rebuilds are identical.
 FROM rust:1.99.1-slim-bookworm AS build
 ARG ZIG_VERSION=0.17.1
@@ -14,8 +15,11 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates
 COPY zig zig
-RUN cargo build --release --locked -p mechbot && strip target/release/mechbot
+RUN cargo build --release --locked -p mechbot -p giddybot \
+ && strip target/release/mechbot target/release/giddybot
 
 FROM debian:bookworm-slim
 COPY --from=build /src/target/release/mechbot /usr/local/bin/mechbot
-ENTRYPOINT ["/usr/local/bin/mechbot"]
+COPY --from=build /src/target/release/giddybot /usr/local/bin/giddybot
+COPY crates/giddy/LICENSE-MIT-giddy /usr/share/doc/giddybot/LICENSE-MIT-giddy
+ENTRYPOINT ["/usr/local/bin/giddybot"]

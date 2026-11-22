@@ -1,0 +1,21 @@
+[package]
+name = "giddybot"
+edition.workspace = true
+version.workspace = true
+build = "build.rs"
+license = "MIT"
+description = "Rust port of the MIT-licensed giddy mechfight/1 Go bot (see LICENSE-MIT-giddy)"
+
+[[bin]]
+name = "giddybot"
+path = "src/main.rs"
+
+[features]
+# `zig`: the terrain heightfield raycast runs in zig/giddy_geom.zig. Without it the
+# pure-Rust twin in world.rs is used (same semantics; see the agreement test).
+default = ["zig"]
+zig = []
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
