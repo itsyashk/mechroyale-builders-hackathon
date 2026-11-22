@@ -1187,8 +1187,8 @@ impl Brain {
             if obs.t - self.srev_last < 0.45 {
                 continue;
             }
-            // further flips inside a burst only when the lead point is actually on us
-            if obs.t - self.srev_last < 1.0 && miss >= 2.5 * my_scale {
+            // v2: flip only when the lead point is actually on us (a bullet that misses anyway needs no reversal)
+            if miss >= 2.5 * my_scale {
                 continue;
             }
             flip = true;
