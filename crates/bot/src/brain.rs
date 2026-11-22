@@ -190,6 +190,9 @@ pub struct Brain {
     juke_dir: [f32; 2],
     juke_src: i64,
     akl_prev: [f32; 2],
+    shd_wp: Option<[f32; 2]>,
+    shd_t: f32,
+    shd_epos: [f32; 2],
     ws: WStat,
     /// Death instrumentation: (t, by, weapon, amount, rear, dist to attacker or -1).
     dth_log: VecDeque<(f32, i64, String, f32, bool, f32)>,
@@ -315,6 +318,11 @@ pub struct Params {
     pub nlr_d: f32,
     /// Slew-aware gun trigger + angular-velocity lead (1 = both, 2 = trigger only).
     pub aps: f32,
+    /// 1 = cover-masked approach to the kill ring (shadow approach).
+    pub shd: f32,
+    pub shd_ring: f32,
+    pub shd_hand: f32,
+    pub shd_cap: f32,
 }
 
 impl Default for Params {
@@ -389,6 +397,10 @@ impl Default for Params {
             nlr_t: 90.0,
             nlr_d: 35.0,
             aps: 1.0,
+            shd: 1.0,
+            shd_ring: 36.0,
+            shd_hand: 40.0,
+            shd_cap: 1.6,
         }
     }
 }
@@ -471,6 +483,10 @@ impl Params {
                     "nlr_t" => p.nlr_t = x,
                     "nlr_d" => p.nlr_d = x,
                     "aps" => p.aps = x,
+                    "shd" => p.shd = x,
+                    "shd_ring" => p.shd_ring = x,
+                    "shd_hand" => p.shd_hand = x,
+                    "shd_cap" => p.shd_cap = x,
                     _ => eprintln!("unknown param {k}"),
                 }
             }
@@ -632,6 +648,9 @@ impl Brain {
             juke_dir: [0.0, 0.0],
             juke_src: -1,
             akl_prev: [0.0, 0.0],
+            shd_wp: None,
+            shd_t: -9.0,
+            shd_epos: [0.0, 0.0],
             ws: WStat { on: std::env::var("MECHBOT_WSTAT").is_ok(), laser_t: -1.0, first_w2_t: -1.0, ..Default::default() },
             dth_log: VecDeque::new(),
             dth_hist: VecDeque::new(),
@@ -927,6 +946,76 @@ impl Brain {
             }
             None => unit2([goal[0] - pos[0], goal[1] - pos[1]]),
         }
+    }
+
+    /// Shadow approach: pick a waypoint on a ring around the enemy that is reachable with
+    /// little exposure to the enemy eye. Returns the waypoint (cached ~0.5 s).
+    fn shadow_wp(&mut self, pos: V3, tpos: V3, tsc: f32, my_scale: f32, ring: f32, circle: ([f32; 2], f32)) -> Option<[f32; 2]> {
+        let p2 = xy(pos);
+        let e2 = xy(tpos);
+        if let Some(w) = self.shd_wp {
+            if self.t - self.shd_t < 0.5 && dist2(e2, self.shd_epos) < 15.0 {
+                return Some(w);
+            }
+        }
+        self.shd_t = self.t;
+        self.shd_epos = e2;
+        self.shd_wp = None;
+        let eeye = Self::eye_of(tpos, tsc);
+        let (gc, gr) = circle;
+        let mut cands: Vec<(f32, [f32; 2])> = Vec::with_capacity(24);
+        for k in 0..24 {
+            let a = k as f32 * PI / 12.0;
+            let c = [e2[0] + ring * a.cos(), e2[1] + ring * a.sin()];
+            if !self.nav.walkable_at(c[0], c[1]) || dist2(c, gc) > gr * 0.9 {
+                continue;
+            }
+            cands.push((dist2(c, p2), c));
+        }
+        cands.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        cands.truncate(6);
+        let mut best: Option<(f32, [f32; 2])> = None;
+        for (sd, c) in cands {
+            let path = self.nav.path(p2, c, 400);
+            let end = path.last().copied().unwrap_or(p2);
+            if dist2(end, c) > 6.0 {
+                continue;
+            }
+            // Path length and exposure along 8 m samples.
+            let mut len = 0.0f32;
+            let mut exp = 0.0f32;
+            let mut prev = p2;
+            let mut acc = 0.0f32;
+            for &w in path.iter() {
+                let seg = dist2(prev, w);
+                len += seg;
+                let mut s0 = 0.0f32;
+                while acc + (seg - s0) >= 8.0 && seg > 0.01 {
+                    s0 += 8.0 - acc;
+                    acc = 0.0;
+                    let f = s0 / seg;
+                    let q = [prev[0] + (w[0] - prev[0]) * f, prev[1] + (w[1] - prev[1]) * f];
+                    let g = self.world.ground(q[0], q[1]);
+                    let qe = Self::eye_of([q[0], q[1], g], my_scale);
+                    if self.world.los(eeye, qe) {
+                        exp += 1.0;
+                    }
+                }
+                acc += seg - s0;
+                prev = w;
+            }
+            if len > self.prm.shd_cap * sd + 10.0 {
+                continue;
+            }
+            let g = self.world.ground(c[0], c[1]);
+            let hidden = !self.world.los(eeye, Self::eye_of([c[0], c[1], g], my_scale));
+            let cost = len + exp + if hidden { 0.0 } else { 3.0 };
+            if best.map(|b| cost < b.0).unwrap_or(true) {
+                best = Some((cost, c));
+            }
+        }
+        self.shd_wp = best.map(|b| b.1);
+        self.shd_wp
     }
 
     fn eye_of(p: V3, scale: f32) -> V3 {
@@ -1808,6 +1897,16 @@ impl Brain {
                     // Ambush: it has to come round the corner to us.
                     let sp = hold_here.unwrap();
                     mv = if dist2(sp, p2) > 2.0 { self.goto(p2, sp) } else { [0.0, 0.0] };
+                } else if self.prm.shd > 0.5
+                    && d > self.prm.shd_hand
+                    && d < 150.0
+                    && (!shootable || d > hi)
+                    && (have_light || !m.has("laser"))
+                    && self.shadow_wp(pos, m.pos, 1.0 + 0.05 * m.cubes.unwrap_or(0) as f32, my_scale, self.prm.shd_ring.max(lo + 2.0), (gc, gr)).is_some()
+                {
+                    let w = self.shd_wp.unwrap();
+                    mv = if dist2(w, p2) > 2.0 { self.goto(p2, w) } else { [0.0, 0.0] };
+                    want_boost = true;
                 } else if !shootable {
                     // Go find a line on it (or wait at a corner when it is a sniper).
                     mv = self.goto(p2, xy(m.pos));
