@@ -10,6 +10,12 @@ use serde_json::Value;
 use std::collections::VecDeque;
 use std::f32::consts::PI;
 use std::fmt::Write;
+
+/// `SIM_HOUSE_FF=1`: squad mates' bullets, beams and splash damage each other (server is a FFA).
+fn ff_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("SIM_HOUSE_FF").map(|v| v == "1").unwrap_or(false))
+}
 use std::sync::Arc;
 
 pub const DT: f32 = 0.05;
@@ -1071,7 +1077,7 @@ impl Game {
             if !m.alive || Some(j) == src_mech {
                 continue;
             }
-            if src_team.is_some() && m.team == src_team {
+            if src_team.is_some() && m.team == src_team && !ff_on() {
                 continue;
             }
             if let Some(t) = phys::seg_cyl(p, d, len, m.pos, m.ms.radius + extra_r, m.ms.height) {
@@ -1312,7 +1318,7 @@ impl Game {
             if !m.alive {
                 continue;
             }
-            if Some(j) != oi && team.is_some() && m.team == team {
+            if Some(j) != oi && team.is_some() && m.team == team && !ff_on() {
                 continue;
             }
             let hd = (dist2d(&m.pos, &p) - m.ms.radius).max(0.0);

@@ -312,6 +312,8 @@ pub struct Params {
     pub nlr: f32,
     pub nlr_t: f32,
     pub nlr_d: f32,
+    /// Friendly-fire lineup: steer so squad hunters stand on each other's firing lines (blend weight; 0 = off).
+    pub ffl: f32,
 }
 
 impl Default for Params {
@@ -385,6 +387,7 @@ impl Default for Params {
             nlr: 2.0,
             nlr_t: 90.0,
             nlr_d: 35.0,
+            ffl: 0.0,
         }
     }
 }
@@ -466,6 +469,7 @@ impl Params {
                     "nlr" => p.nlr = x,
                     "nlr_t" => p.nlr_t = x,
                     "nlr_d" => p.nlr_d = x,
+                    "ffl" => p.ffl = x,
                     _ => eprintln!("unknown param {k}"),
                 }
             }
@@ -2159,6 +2163,75 @@ impl Brain {
                 let b = self.juke_dir;
                 if b != [0.0, 0.0] {
                     self.strafe_switch_t = self.juke_until + 0.2;
+                }
+            }
+        }
+
+        // Friendly-fire lineup: shots/chains/splash cannot tell squad mates apart, so prefer
+        // positions where one hunter stands on another's line to us (or two clump within splash).
+        if self.prm.ffl > 0.0 && !kiting && obs.t >= self.juke_until && matches!(mode, Mode::Fight | Mode::Cover | Mode::Hold | Mode::Roam | Mode::Farm) {
+            let mut hs: Vec<[f32; 2]> = enemies
+                .iter()
+                .filter(|m| hdist(m.pos, pos) < 110.0 && (m.pos[2] - pos[2]).abs() < 15.0)
+                .map(|m| xy(m.pos))
+                .collect();
+            if hs.len() >= 2 {
+                hs.sort_by(|a, b| dist2(*a, p2).partial_cmp(&dist2(*b, p2)).unwrap_or(std::cmp::Ordering::Equal));
+                hs.truncate(8);
+                let near = hs[0];
+                let shield = |q: [f32; 2]| -> f32 {
+                    let mut sc = 0.0f32;
+                    for (ia, a) in hs.iter().enumerate() {
+                        let da = dist2(*a, q);
+                        if da < 1.0 {
+                            continue;
+                        }
+                        let u = [(q[0] - a[0]) / da, (q[1] - a[1]) / da];
+                        for (ib, b) in hs.iter().enumerate() {
+                            if ia == ib {
+                                continue;
+                            }
+                            let rel = [b[0] - a[0], b[1] - a[1]];
+                            let t = rel[0] * u[0] + rel[1] * u[1];
+                            if ib > ia && dist2(*a, *b) < 7.0 {
+                                sc += 0.3;
+                            }
+                            if t <= 0.0 || t >= da {
+                                continue;
+                            }
+                            let perp = (rel[0] * u[1] - rel[1] * u[0]).abs();
+                            if perp < 2.5 + 0.8 {
+                                sc += 1.0;
+                            }
+                        }
+                    }
+                    sc
+                };
+                let base = shield(p2);
+                let mut best: Option<(f32, [f32; 2])> = None;
+                for k in 0..12 {
+                    let a = k as f32 * 2.0 * PI / 12.0;
+                    let dv = [a.cos(), a.sin()];
+                    let q = [p2[0] + dv[0] * 8.0, p2[1] + dv[1] * 8.0];
+                    if !self.nav.walkable_at(q[0], q[1]) || !self.nav.line_walkable(p2, q) {
+                        continue;
+                    }
+                    let mut sc = shield(q);
+                    // rear exposure: do not trade the lineup for backing away into the open
+                    let dn = unit2([near[0] - p2[0], near[1] - p2[1]]);
+                    sc -= 0.4 * (-(dv[0] * dn[0] + dv[1] * dn[1])).max(0.0);
+                    if dist2(q, gc) > gr {
+                        sc -= 1.0;
+                    }
+                    if best.map(|b| sc > b.0).unwrap_or(true) {
+                        best = Some((sc, dv));
+                    }
+                }
+                if let Some((sc, dv)) = best {
+                    if sc > base + 0.25 {
+                        let w = self.prm.ffl;
+                        mv = unit2([mv[0] + dv[0] * w, mv[1] + dv[1] * w]);
+                    }
                 }
             }
         }
