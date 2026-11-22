@@ -183,6 +183,10 @@ pub struct Brain {
     sn_prev_charge: f32,
     sn_active: bool,
     sn_stat: [u32; 4],
+    srev_seen: VecDeque<i64>,
+    srev_last: f32,
+    /// shot-reversal stats: [aimed bullets, close (<2.5m) total, close after a recent flip, aimed after a recent flip, flips]
+    srev_stat: [u32; 5],
     duels: HashMap<i64, Duel>,
     duel_on: bool,
     juke_until: f32,
@@ -307,6 +311,8 @@ pub struct Params {
     pub lcook: f32,
     /// 1 = never retreat (full berserk).
     pub noret: f32,
+    /// 1 = reverse strafe when an enemy gun bullet spawns aimed at us (45-125 m).
+    pub srev: f32,
     /// Remember out-of-view enemies for this many s (cover choice, threat estimate).
     pub memt: f32,
     pub nlr: f32,
@@ -381,6 +387,7 @@ impl Default for Params {
             mclus: 0.0,
             lcook: 0.0,
             noret: 1.0,
+            srev: 0.0,
             memt: 0.0,
             nlr: 2.0,
             nlr_t: 90.0,
@@ -462,6 +469,7 @@ impl Params {
                     "mclus" => p.mclus = x,
                     "lcook" => p.lcook = x,
                     "noret" => p.noret = x,
+                    "srev" => p.srev = x,
                     "memt" => p.memt = x,
                     "nlr" => p.nlr = x,
                     "nlr_t" => p.nlr_t = x,
@@ -622,6 +630,9 @@ impl Brain {
             sn_prev_charge: 0.0,
             sn_active: false,
             sn_stat: [0; 4],
+            srev_seen: VecDeque::new(),
+            srev_last: -100.0,
+            srev_stat: [0; 5],
             duels: HashMap::new(),
             juke_until: -1.0,
             juke_dir: [0.0, 0.0],
@@ -769,7 +780,7 @@ impl Brain {
     }
 
     pub fn log_end(&self, raw: &str) {
-        eprintln!("end: {raw} gunstat[mech_ticks,fire,nolos,range,ammo/reload,aim,hold]={:?} sniper[peek,hide,nopair,_]={:?}", self.gstat, self.sn_stat);
+        eprintln!("end: {raw} gunstat[mech_ticks,fire,nolos,range,ammo/reload,aim,hold]={:?} sniper[peek,hide,nopair,_]={:?} srev[aimed,close,close_after_flip,aimed_after_flip,flips]={:?}", self.gstat, self.sn_stat, self.srev_stat);
         if self.ws.on {
             let w = &self.ws;
             eprintln!(
@@ -1105,6 +1116,95 @@ impl Brain {
             }
         }
         best.map(|b| (b.1, b.2))
+    }
+
+    /// Detect newly spawned enemy gun bullets aimed at us and reverse the strafe direction.
+    fn shot_reversal(&mut self, obs: &Obs, my_scale: f32, p2: [f32; 2]) {
+        let me = &obs.me;
+        let c = [me.pos[0], me.pos[1], me.pos[2] + 4.5 * my_scale];
+        let recent = obs.t - self.srev_last < 0.5;
+        let mut flip = false;
+        for p in &obs.projectiles {
+            if p.kind != "gun" || self.srev_seen.contains(&p.id) {
+                continue;
+            }
+            self.srev_seen.push_back(p.id);
+            if self.srev_seen.len() > 64 {
+                self.srev_seen.pop_front();
+            }
+            let sp = len3(p.vel);
+            if sp < 1.0 {
+                continue;
+            }
+            let vh = scale(p.vel, 1.0 / sp);
+            // closest approach of the bullet to our centre
+            let rel = sub(c, p.pos);
+            let along = rel[0] * vh[0] + rel[1] * vh[1] + rel[2] * vh[2];
+            if along < 0.0 {
+                continue;
+            }
+            let cp = add(p.pos, scale(vh, along));
+            let miss = len3(sub(cp, c));
+            // pointing within 6 deg of us
+            let dd = len3(rel).max(1e-3);
+            if along / dd < (6.0f32).to_radians().cos() {
+                continue;
+            }
+            // which visible enemy muzzle did it come from (back-projected within 4 m)
+            let mut shooter: Option<f32> = None;
+            for m in obs.mechs.iter().filter(|m| m.is_mech() && m.id != me.id) {
+                let ms = 1.0 + 0.05 * m.cubes.unwrap_or(0) as f32;
+                let mz = [m.pos[0], m.pos[1], m.pos[2] + 7.0 * ms];
+                let r = sub(p.pos, mz);
+                let s_al = r[0] * vh[0] + r[1] * vh[1] + r[2] * vh[2];
+                if !(-3.0..=32.0).contains(&s_al) {
+                    continue;
+                }
+                let perp = sub(r, scale(vh, s_al));
+                if len3(perp) < 4.0 {
+                    shooter = Some(hdist(m.pos, me.pos));
+                    break;
+                }
+            }
+            let Some(d) = shooter else { continue };
+            self.srev_stat[0] += 1;
+            if recent {
+                self.srev_stat[3] += 1;
+            }
+            if miss < 2.5 * my_scale {
+                self.srev_stat[1] += 1;
+                if recent {
+                    self.srev_stat[2] += 1;
+                }
+            }
+            if self.prm.srev < 0.5 {
+                continue;
+            }
+            let flight = d / 252.0;
+            if d <= 35.0 || !(0.18..=0.5).contains(&flight) {
+                continue;
+            }
+            if obs.t - self.srev_last < 0.45 {
+                continue;
+            }
+            // further flips inside a burst only when the lead point is actually on us
+            if obs.t - self.srev_last < 1.0 && miss >= 2.5 * my_scale {
+                continue;
+            }
+            flip = true;
+        }
+        if flip {
+            // respect walkability: room to move the opposite way to our current motion
+            let v = [me.vel[0], me.vel[1]];
+            let vl = (v[0] * v[0] + v[1] * v[1]).sqrt();
+            let dir = if vl > 1.0 { [-v[0] / vl, -v[1] / vl] } else { [0.0, 0.0] };
+            if vl <= 1.0 || self.nav.walkable_at(p2[0] + dir[0] * 5.0, p2[1] + dir[1] * 5.0) {
+                self.strafe_sign = -self.strafe_sign;
+                self.strafe_switch_t = obs.t + 0.7;
+                self.srev_last = obs.t;
+                self.srev_stat[4] += 1;
+            }
+        }
     }
 
     /// Direction to sidestep incoming projectiles, if any threaten us.
@@ -1718,6 +1818,8 @@ impl Brain {
             .as_ref()
             .map(|(m, _)| Target { id: m.id, pos: m.pos, vel: m.vel, kind: TargetKind::Mech, scale: 1.0 + 0.05 * m.cubes.unwrap_or(0) as f32 })
             .or(aux_target);
+
+        self.shot_reversal(obs, my_scale, p2);
 
         if obs.t > self.strafe_switch_t {
             self.strafe_sign = if self.rng.f() < 0.5 { -1.0 } else { 1.0 };
