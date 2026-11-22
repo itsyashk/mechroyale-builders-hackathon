@@ -633,7 +633,7 @@ impl Brain {
         } else {
             self.other_dead = 0;
         }
-        if self.other_dead >= 5 {
+        if self.other_dead >= 5 && std::env::var("GIDDY_FORCE_PRAC").is_err() {
             self.not_practice = true;
         }
         let on = self.base.practice && !self.not_practice && now > 20.0;
