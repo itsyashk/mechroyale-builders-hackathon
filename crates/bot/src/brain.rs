@@ -308,6 +308,8 @@ pub struct Params {
     pub lcook: f32,
     /// 1 = never retreat (full berserk).
     pub noret: f32,
+    /// 1 = gun fires whenever target is in LOS and range (no alignment gate, no cover hold-fire).
+    pub spray: f32,
     /// Remember out-of-view enemies for this many s (cover choice, threat estimate).
     pub memt: f32,
     pub nlr: f32,
@@ -384,6 +386,7 @@ impl Default for Params {
             mclus: 0.0,
             lcook: 0.0,
             noret: 1.0,
+            spray: 1.0,
             memt: 0.0,
             nlr: 2.0,
             nlr_t: 90.0,
@@ -466,6 +469,7 @@ impl Params {
                     "mclus" => p.mclus = x,
                     "lcook" => p.lcook = x,
                     "noret" => p.noret = x,
+                    "spray" => p.spray = x,
                     "memt" => p.memt = x,
                     "nlr" => p.nlr = x,
                     "nlr_t" => p.nlr_t = x,
@@ -2527,7 +2531,7 @@ impl Brain {
                     ok_aim = true;
                 }
             }
-            if los && d < range && ammo > 0.0 && !reloading && ok_aim && allow {
+            if los && d < range && ammo > 0.0 && !reloading && (ok_aim && allow || self.prm.spray > 0.0) {
                 fire[gi] = true;
             }
             if matches!(tg.kind, TargetKind::Mech) {
