@@ -360,7 +360,7 @@ impl Default for Params {
             sn_min_d: 45.0,
             sn_r: 17.0,
             sn_stay: 0.0,
-            sn_loot: 200.0,
+            sn_loot: 400.0,
             sn_others: 40.0,
             sn_cover: 0.0,
             sn_hyst: 0.0,
