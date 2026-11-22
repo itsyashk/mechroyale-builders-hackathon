@@ -163,6 +163,9 @@ pub struct Brain {
     debug: bool,
     debug_every: u64,
     gstat: [u32; 7],
+    /// smart-reload counters: [dry ticks near, manual-reload-in-fight ticks, first contacts, mag sum at first contact, free top-ups]
+    rl_stat: [u32; 5],
+    rl_near_prev: bool,
     dodge_goal: Option<[f32; 2]>,
     dodge_check_t: f32,
     dodges: u32,
@@ -307,6 +310,8 @@ pub struct Params {
     pub lcook: f32,
     /// 1 = never retreat (full berserk).
     pub noret: f32,
+    /// 1 = smart reload: free top-ups when no enemy is near, no manual reload mid-fight.
+    pub rl: f32,
     /// Remember out-of-view enemies for this many s (cover choice, threat estimate).
     pub memt: f32,
     pub nlr: f32,
@@ -381,6 +386,7 @@ impl Default for Params {
             mclus: 0.0,
             lcook: 0.0,
             noret: 1.0,
+            rl: 0.0,
             memt: 0.0,
             nlr: 2.0,
             nlr_t: 90.0,
@@ -462,6 +468,7 @@ impl Params {
                     "mclus" => p.mclus = x,
                     "lcook" => p.lcook = x,
                     "noret" => p.noret = x,
+                    "rl" => p.rl = x,
                     "memt" => p.memt = x,
                     "nlr" => p.nlr = x,
                     "nlr_t" => p.nlr_t = x,
@@ -638,6 +645,8 @@ impl Brain {
             duel_on: std::env::var("MECHBOT_DUEL").is_ok(),
             debug: std::env::var("MECHBOT_DEBUG").is_ok(),
             gstat: [0; 7],
+            rl_stat: [0; 5],
+            rl_near_prev: false,
             debug_every: std::env::var("MECHBOT_DEBUG").ok().and_then(|v| v.parse().ok()).unwrap_or(10).max(1),
         })
     }
@@ -769,7 +778,7 @@ impl Brain {
     }
 
     pub fn log_end(&self, raw: &str) {
-        eprintln!("end: {raw} gunstat[mech_ticks,fire,nolos,range,ammo/reload,aim,hold]={:?} sniper[peek,hide,nopair,_]={:?}", self.gstat, self.sn_stat);
+        eprintln!("end: {raw} gunstat[mech_ticks,fire,nolos,range,ammo/reload,aim,hold]={:?} sniper[peek,hide,nopair,_]={:?} rl[dry,rl_fight,contacts,mag_sum,topups]={:?}", self.gstat, self.sn_stat, self.rl_stat);
         if self.ws.on {
             let w = &self.ws;
             eprintln!(
@@ -2354,6 +2363,51 @@ impl Brain {
         for w in me.weapons.iter().flatten() {
             if w.kind == "gun" && w.ammo.unwrap_or(1.0) <= 0.0 && w.reload.unwrap_or(0.0) <= 0.0 {
                 act.reload = true;
+            }
+        }
+        if self.prm.rl > 0.5 {
+            // Smart reload: nearest enemy (visible, or tracked < 4 s) and whether it closes on us.
+            let mut dn = f32::MAX;
+            let mut closing = false;
+            for m in obs.mechs.iter().filter(|m| m.is_mech() && m.id != me.id) {
+                let d = hdist(m.pos, pos);
+                if d < dn {
+                    dn = d;
+                    closing = (m.vel[0] * (pos[0] - m.pos[0]) + m.vel[1] * (pos[1] - m.pos[1])) > 0.0;
+                }
+            }
+            for t in self.tracks.values().filter(|t| obs.t - t.seen_t < 4.0) {
+                let d = hdist(t.pos, pos);
+                if d < dn {
+                    dn = d;
+                    closing = (t.vel[0] * (pos[0] - t.pos[0]) + t.vel[1] * (pos[1] - t.pos[1])) > 0.0;
+                }
+            }
+            let charging = me.weapons.iter().flatten().any(|w| w.kind == "laser" && w.charge.unwrap_or(0.0) > 0.0);
+            if let Some(g) = me.weapons.iter().flatten().find(|w| w.kind == "gun") {
+                let ammo = g.ammo.unwrap_or(12.0);
+                let reloading = g.reload.unwrap_or(0.0) > 0.0;
+                let near = dn < 140.0;
+                if near && !self.rl_near_prev {
+                    self.rl_stat[2] += 1;
+                    self.rl_stat[3] += ammo.max(0.0) as u32;
+                }
+                self.rl_near_prev = near;
+                if dn < 70.0 && (ammo <= 0.0 || reloading) {
+                    self.rl_stat[0] += 1;
+                }
+                let want_manual = !reloading && !charging && ((!near && ammo <= 9.0) || (dn > 70.0 && dn < 1.0e8 && closing && ammo <= 6.0));
+                if want_manual {
+                    if !act.reload {
+                        self.rl_stat[4] += 1;
+                    }
+                    act.reload = true;
+                } else if dn < 70.0 && ammo > 2.0 && !reloading {
+                    // Never burn the magazine early inside a fight; it auto-reloads at 0.
+                    act.reload = false;
+                } else if dn < 70.0 && act.reload && ammo > 0.0 {
+                    self.rl_stat[1] += 1;
+                }
             }
         }
         // A charging laser cannot be swapped.
