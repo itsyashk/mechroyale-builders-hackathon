@@ -133,9 +133,9 @@ pub struct Params {
 
 /// Baked-in tuning overrides ("k=v,k=v"), applied on top of both the base and the
 /// practice-mode parameters. Bools take 1/0.
-pub const OVERRIDES: &str = "";
+pub const OVERRIDES: &str = "end_ghost=0,all_foes=1,fight_loot=110,fm_exp=60";
 /// Perturbs only the bot's RNG seed, for independent draws of the same strategy.
-pub const SALT: u64 = 0;
+pub const SALT: u64 = 16;
 
 pub fn apply_overrides(p: &mut Params) {
     for kv in OVERRIDES.split(',') {
