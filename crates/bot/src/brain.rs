@@ -388,7 +388,7 @@ impl Default for Params {
             nlr: 2.0,
             nlr_t: 90.0,
             nlr_d: 35.0,
-            aps: 0.0,
+            aps: 1.0,
         }
     }
 }
