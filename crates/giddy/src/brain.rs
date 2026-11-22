@@ -450,19 +450,18 @@ impl Brain {
 
     /// Go's Act: step + panic recovery + NaN scrubbing.
     pub fn act(&mut self, o: &mut Obs) -> Action {
-        let mut act = Action { tick: o.tick, ..Default::default() };
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut a = Action { tick: o.tick, ..Default::default() };
             self.step(o, &mut a);
             a
         }));
-        match r {
-            Ok(a) => act = a,
+        let mut act = match r {
+            Ok(a) => a,
             Err(_) => {
                 self.panics += 1;
                 return Action { tick: o.tick, aim: Some(self.last_aim), ..Default::default() };
             }
-        }
+        };
         if let Some(a) = act.aim {
             if bad_f(a[0]) || bad_f(a[1]) {
                 act.aim = None;
