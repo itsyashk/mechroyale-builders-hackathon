@@ -1616,7 +1616,7 @@ impl Brain {
                     continue;
                 }
                 // Finish the fight we are in, unless the ring is right here.
-                if target_mech.is_some() && tgt_d < 35.0 && dd > 25.0 {
+                if target_mech.is_some() && (tgt_d < 90.0 && hp_frac >= 0.55 || tgt_d < 35.0) && dd > 25.0 {
                     continue;
                 }
                 let mut n_near = 0;
