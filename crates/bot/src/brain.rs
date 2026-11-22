@@ -189,6 +189,14 @@ pub struct Brain {
     juke_dir: [f32; 2],
     juke_src: i64,
     akl_prev: [f32; 2],
+    /// doom-dive state: flagged, consecutive-tick counter, flag time, counters.
+    doom: bool,
+    doom_cnt: u32,
+    doom_t0: f32,
+    doom_ticks: u32,
+    doom_n: u32,
+    doom_fp: u32,
+    doom_lrel: f32,
     ws: WStat,
     /// Death instrumentation: (t, by, weapon, amount, rear, dist to attacker or -1).
     dth_log: VecDeque<(f32, i64, String, f32, bool, f32)>,
@@ -312,6 +320,14 @@ pub struct Params {
     pub nlr: f32,
     pub nlr_t: f32,
     pub nlr_d: f32,
+    /// Doom dive: 1 = when death is near-certain (ttd small), go all-in on the weakest enemy.
+    pub dd: f32,
+    /// Enter doomed when ttd < this (s).
+    pub dd_in: f32,
+    /// Leave doomed when ttd > this (s).
+    pub dd_out: f32,
+    /// Only dive when this few or fewer mechs are alive.
+    pub dd_alive: f32,
 }
 
 impl Default for Params {
@@ -385,6 +401,10 @@ impl Default for Params {
             nlr: 2.0,
             nlr_t: 90.0,
             nlr_d: 35.0,
+            dd: 0.0,
+            dd_in: 3.0,
+            dd_out: 4.5,
+            dd_alive: 10.0,
         }
     }
 }
@@ -466,6 +486,10 @@ impl Params {
                     "nlr" => p.nlr = x,
                     "nlr_t" => p.nlr_t = x,
                     "nlr_d" => p.nlr_d = x,
+                    "dd" => p.dd = x,
+                    "dd_in" => p.dd_in = x,
+                    "dd_out" => p.dd_out = x,
+                    "dd_alive" => p.dd_alive = x,
                     _ => eprintln!("unknown param {k}"),
                 }
             }
@@ -627,6 +651,13 @@ impl Brain {
             juke_dir: [0.0, 0.0],
             juke_src: -1,
             akl_prev: [0.0, 0.0],
+            doom: false,
+            doom_cnt: 0,
+            doom_t0: -1.0,
+            doom_ticks: 0,
+            doom_n: 0,
+            doom_fp: 0,
+            doom_lrel: 0.0,
             ws: WStat { on: std::env::var("MECHBOT_WSTAT").is_ok(), laser_t: -1.0, first_w2_t: -1.0, ..Default::default() },
             dth_log: VecDeque::new(),
             dth_hist: VecDeque::new(),
@@ -770,6 +801,9 @@ impl Brain {
 
     pub fn log_end(&self, raw: &str) {
         eprintln!("end: {raw} gunstat[mech_ticks,fire,nolos,range,ammo/reload,aim,hold]={:?} sniper[peek,hide,nopair,_]={:?}", self.gstat, self.sn_stat);
+        if self.prm.dd > 0.0 {
+            eprintln!("doom: entries={} ticks={} false_pos={}", self.doom_n, self.doom_ticks, self.doom_fp);
+        }
         if self.ws.on {
             let w = &self.ws;
             eprintln!(
@@ -1485,6 +1519,41 @@ impl Brain {
         let ttd = me.hp / incoming.max(1.0);
         self.last_ttk = ttk;
         self.last_ttd = ttd;
+        // Doom dive: death is near-certain, so survival has no value; flag it with hysteresis.
+        if self.prm.dd > 0.0 {
+            let heal_near = obs.drops.iter().any(|d| hdist(d.pos, pos) < 70.0 && d.lands_in < 6.0);
+            let base = obs.alive <= self.prm.dd_alive as i32
+                && !heal_near
+                && !enemies.is_empty()
+                && incoming > 1.0
+                && ttk > ttd * 0.8;
+            if self.doom {
+                self.doom_ticks += 1;
+                if !base || ttd > self.prm.dd_out {
+                    if obs.t - self.doom_t0 > 5.0 {
+                        self.doom_fp += 1;
+                        if self.debug {
+                            eprintln!("  DOOM false-positive t={:.1} flagged_for={:.1}", obs.t, obs.t - self.doom_t0);
+                        }
+                    }
+                    self.doom = false;
+                    self.doom_cnt = 0;
+                }
+            } else if base && ttd < self.prm.dd_in {
+                self.doom_cnt += 1;
+                if self.doom_cnt >= 2 {
+                    self.doom = true;
+                    self.doom_t0 = obs.t;
+                    self.doom_n += 1;
+                    if self.debug {
+                        eprintln!("  DOOM on t={:.1} hp={:.0} ttd={:.1} ttk={:.1}", obs.t, me.hp, ttd, ttk);
+                    }
+                }
+            } else {
+                self.doom_cnt = 0;
+            }
+        }
+        let doomed = self.doom;
         if self.retreating {
             let safe = hp_frac > 0.8 || enemies.is_empty() && obs.t - self.last_dmg_t > 10.0;
             let cornered = tgt_d < 30.0 && ttk < ttd * 0.8 || self.prm.corner_d > 0.0 && tgt_d < self.prm.corner_d && n_shooting <= 1;
@@ -1543,6 +1612,27 @@ impl Brain {
                 }
             }
         }
+        // Doom dive: all-in on the weakest enemy we can hit.
+        if doomed {
+            let reach = if have_laser { 270.0 } else if has("gun") { 200.0 } else if has("mortar") { 200.0 } else { 40.0 };
+            let mut best: Option<(f32, &Mech, bool)> = None;
+            for m in &enemies {
+                let d = hdist(m.pos, pos);
+                if d > reach {
+                    continue;
+                }
+                let sc = 1.0 + 0.05 * m.cubes.unwrap_or(0) as f32;
+                let shootable = self.world.los(muzzle, [m.pos[0], m.pos[1], m.pos[2] + 4.5 * sc]);
+                let s = m.hp.unwrap_or(1400.0) + if shootable { 0.0 } else { 600.0 } + d * 1.5;
+                if best.map(|b| s < b.0).unwrap_or(true) {
+                    best = Some((s, m, shootable));
+                }
+            }
+            if let Some(b) = best {
+                target_mech = Some((b.1.clone(), b.2));
+                self.target_id = Some(b.1.id);
+            }
+        }
         // Heal between fights: nobody is shooting us and we are hurt -> hide and regenerate
         // rather than starting the next fight.
         let under_fire = obs.t - self.last_dmg_t < 2.5;
@@ -1562,7 +1652,7 @@ impl Brain {
             mode = Mode::Zone;
             goal = Some(Self::clamp_into(p2, gc, gr * 0.7));
             want_boost = !me.in_zone;
-        } else if target_mech.is_some() && (self.retreating || sniper || healing || self.prm.engage_all < 0.5 && _avoid) {
+        } else if target_mech.is_some() && !doomed && (self.retreating || sniper || healing || self.prm.engage_all < 0.5 && _avoid) {
             mode = Mode::Cover;
         } else if target_mech.is_some() {
             mode = Mode::Fight;
@@ -1796,6 +1886,7 @@ impl Brain {
                 } else {
                     (lo, hi)
                 };
+                let (lo, hi) = if doomed { (0.0, 24.0) } else { (lo, hi) };
                 let lsh = self.prm.leash;
                 let hold_here = hold_spot.filter(|sp| dist2(*sp, p2) < lsh + 15.0);
                 if !shootable && hold_here.is_some() && d > 40.0 {
@@ -1852,7 +1943,7 @@ impl Brain {
 
         // Tactical position: with several enemies around, fight from a spot that sees the
         // target but is hidden from the others.
-        if mode == Mode::Fight && self.prm.tactic > 0.5 && threat_eyes.len() >= 2 {
+        if mode == Mode::Fight && !doomed && self.prm.tactic > 0.5 && threat_eyes.len() >= 2 {
             if let Some((m, _)) = &target_mech {
                 let tsc = 1.0 + 0.05 * m.cubes.unwrap_or(0) as f32;
                 let tc = [m.pos[0], m.pos[1], m.pos[2] + 4.5 * tsc];
@@ -1912,7 +2003,7 @@ impl Brain {
             }
             self.sn_prev_charge = ch;
         }
-        if self.prm.sniper > 0.0 && (mode == Mode::Fight || self.prm.sn_cover > 0.0 && mode == Mode::Cover && hp_frac > 0.3) {
+        if self.prm.sniper > 0.0 && !doomed && (mode == Mode::Fight || self.prm.sn_cover > 0.0 && mode == Mode::Cover && hp_frac > 0.3) {
             if let (Some((m, _)), Some((ch, cd, full, lrange))) = (&target_mech, lz) {
                 let d = hdist(m.pos, pos);
                 let tsc = 1.0 + 0.05 * m.cubes.unwrap_or(0) as f32;
@@ -1948,7 +2039,7 @@ impl Brain {
         }
 
         // Laser magnet: a laser on the ground nearby is worth breaking off for, even mid-fight.
-        if self.prm.sn_loot > 0.0 && !have_laser && !self.retreating && !zone_urgent && matches!(mode, Mode::Fight | Mode::Cover | Mode::Farm | Mode::Hold | Mode::Roam) {
+        if self.prm.sn_loot > 0.0 && !doomed && !have_laser && !self.retreating && !zone_urgent && matches!(mode, Mode::Fight | Mode::Cover | Mode::Farm | Mode::Hold | Mode::Roam) {
             let near = self
                 .pickups
                 .iter()
@@ -2022,7 +2113,7 @@ impl Brain {
         }
 
         // Cube magnet: kills drop cubes (+4% HP and damage each); grab nearby ones even mid-fight.
-        if self.prm.magnet > 0.0 && matches!(mode, Mode::Fight | Mode::Farm | Mode::Cover) && !self.retreating {
+        if self.prm.magnet > 0.0 && !doomed && matches!(mode, Mode::Fight | Mode::Farm | Mode::Cover) && !self.retreating {
             if let Some(c) = obs
                 .cubes
                 .iter()
@@ -2036,7 +2127,7 @@ impl Brain {
         }
 
         // Laser dodge: an enemy charging at us with a clear line -> duck into nearby cover.
-        if matches!(mode, Mode::Fight | Mode::Farm | Mode::Roam | Mode::Loot | Mode::Hold) {
+        if !doomed && matches!(mode, Mode::Fight | Mode::Farm | Mode::Roam | Mode::Loot | Mode::Hold) {
             let me_c = [pos[0], pos[1], pos[2] + 4.5 * my_scale];
             let charger = enemies
                 .iter()
@@ -2066,7 +2157,7 @@ impl Brain {
         // Anti-lightning kite: an arc thrower inside ~50 m out-damages anything we carry and
         // follows us into cover, so back-pedal (torso keeps shooting) to stay out of its range.
         let mut kiting = false;
-        if self.prm.akl > 0.0 && matches!(mode, Mode::Fight | Mode::Cover | Mode::Farm | Mode::Loot | Mode::Roam | Mode::Hold) && (!have_light || self.prm.akl_own > 0.5) {
+        if self.prm.akl > 0.0 && !doomed && matches!(mode, Mode::Fight | Mode::Cover | Mode::Farm | Mode::Loot | Mode::Roam | Mode::Hold) && (!have_light || self.prm.akl_own > 0.5) {
             let zappers: Vec<[f32; 2]> = enemies
                 .iter()
                 .filter(|m| m.has("lightning") && hdist(m.pos, pos) < self.prm.akl && (m.pos[2] - pos[2]).abs() < 12.0)
@@ -2120,7 +2211,7 @@ impl Brain {
 
         // Laser juke: house lasers aim at where we were a reaction time ago plus our velocity
         // then; a hard lateral reversal shortly before release makes that prediction miss.
-        if self.prm.lj > 0.0 && matches!(mode, Mode::Fight | Mode::Cover) && (self.dodge_goal.is_none() || self.prm.lj > 1.5 || mode == Mode::Cover) {
+        if self.prm.lj > 0.0 && !doomed && matches!(mode, Mode::Fight | Mode::Cover) && (self.dodge_goal.is_none() || self.prm.lj > 1.5 || mode == Mode::Cover) {
             let me_c = [pos[0], pos[1], pos[2] + 4.5 * my_scale];
             let mut best: Option<(f32, i64, [f32; 2])> = None;
             for m in enemies.iter().filter(|m| m.charging) {
@@ -2164,7 +2255,7 @@ impl Brain {
         }
 
         // Projectile dodge: steer away from bullets/shells predicted to hit us.
-        if let Some(dv) = self.projectile_dodge(obs, my_scale) {
+        if let Some(dv) = if doomed { None } else { self.projectile_dodge(obs, my_scale) } {
             let blend = unit2([mv[0] * 0.4 + dv[0], mv[1] * 0.4 + dv[1]]);
             if self.nav.walkable_at(p2[0] + blend[0] * 3.0, p2[1] + blend[1] * 3.0) {
                 mv = blend;
@@ -2230,6 +2321,13 @@ impl Brain {
         // ---- aim & fire
         let mut aim: Option<[f32; 2]> = None;
         let mut fire = [false, false];
+        self.doom_lrel = 0.0;
+        if doomed {
+            if let Some(tg) = &tgt {
+                let still = hdist(tg.vel, [0.0, 0.0, 0.0]) < 2.0;
+                self.doom_lrel = if still && ttd > 0.9 { 1.0 } else { 0.25 };
+            }
+        }
         if let Some(tg) = tgt {
             let (a, f) = self.weapons_on(obs, tg, muzzle, mode == Mode::Cover, self.sn_active);
             aim = Some(a);
@@ -2337,7 +2435,7 @@ impl Brain {
             }
         }
         // Tactical reload: the target has no line on us, so top up the magazine now.
-        if self.prm.treload > 0.0 {
+        if self.prm.treload > 0.0 && !doomed {
             if let Some(tg) = &tgt {
                 let c = [tg.pos[0], tg.pos[1], tg.pos[2] + 4.5 * tg.scale];
                 if !self.world.los(muzzle, c) {
@@ -2456,12 +2554,13 @@ impl Brain {
                 aim = direct;
                 if self.prm.chg_gun > 0.0 && gun_live {
                     if let Some(ga) = gun_aim {
-                        if charge < full * self.prm.lrel.min(1.0) - swing(ga) {
+                        if charge < full * (if self.doom_lrel > 0.0 { self.doom_lrel } else { self.prm.lrel.min(1.0) }) - swing(ga) {
                             aim = ga;
                         }
                     }
                 }
-                let ready = charge >= full * self.prm.lrel.min(1.0) - 0.03;
+                let lrel = if self.doom_lrel > 0.0 { self.doom_lrel } else { self.prm.lrel.min(1.0) };
+                let ready = charge >= full * lrel - 0.03;
                 if ready && los && aligned(direct) {
                     fire[li] = false; // release
                 } else {
@@ -2537,7 +2636,12 @@ impl Brain {
                 && matches!(tg.kind, TargetKind::Mech)
                 && (hdist(tg.vel, [0.0, 0.0, 0.0]) < 2.5
                     || self.tracks.iter().any(|(id, t)| *id != tg.id && obs.t - t.seen_t < 0.5 && hdist(t.pos, tg.pos) < 12.0));
-            if mw.cooldown <= 0.05 && dh > 22.0 && dh < 225.0 && (!los || gun_busy || zapper || clus) && !laser_busy && allow {
+            let doom_finish = self.doom_lrel > 0.0
+                && dh > 4.0
+                && dh <= 22.0
+                && los
+                && self.tracks.get(&tg.id).map(|t| t.hp <= 200.0 * (1.0 + 0.04 * me.cubes.min(10) as f32)).unwrap_or(false);
+            if mw.cooldown <= 0.05 && (dh > 22.0 || doom_finish) && dh < 225.0 && (!los || gun_busy || zapper || clus || doom_finish) && !laser_busy && allow {
                 let sp = mw.stat("speed", 72.0);
                 let g = mw.stat("gravity", self.gravity);
                 let tube = [pos[0], pos[1], pos[2] + statf(me, "height", 9.0) + 0.5];
