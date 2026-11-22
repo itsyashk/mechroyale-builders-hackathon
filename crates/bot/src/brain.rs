@@ -147,6 +147,7 @@ pub struct Brain {
     path_t: f32,
     strafe_sign: f32,
     strafe_switch_t: f32,
+    zsq_sign_t: f32,
     pos_hist: VecDeque<(f32, [f32; 2], bool)>,
     unstick_until: f32,
     unstick_dir: [f32; 2],
@@ -312,6 +313,11 @@ pub struct Params {
     pub nlr: f32,
     pub nlr_t: f32,
     pub nlr_d: f32,
+    /// Zone squeeze: 1 = fight from inside the circle so the target ends up on the outer side.
+    pub zsq: f32,
+    pub zsq_w: f32,
+    pub zsq_c: f32,
+    pub zsq_in: f32,
 }
 
 impl Default for Params {
@@ -385,6 +391,10 @@ impl Default for Params {
             nlr: 2.0,
             nlr_t: 90.0,
             nlr_d: 35.0,
+            zsq: 0.0,
+            zsq_w: 0.6,
+            zsq_c: 40.0,
+            zsq_in: 10.0,
         }
     }
 }
@@ -466,6 +476,10 @@ impl Params {
                     "nlr" => p.nlr = x,
                     "nlr_t" => p.nlr_t = x,
                     "nlr_d" => p.nlr_d = x,
+                    "zsq" => p.zsq = x,
+                    "zsq_w" => p.zsq_w = x,
+                    "zsq_c" => p.zsq_c = x,
+                    "zsq_in" => p.zsq_in = x,
                     _ => eprintln!("unknown param {k}"),
                 }
             }
@@ -589,6 +603,7 @@ impl Brain {
             path_t: -100.0,
             strafe_sign: 1.0,
             strafe_switch_t: 0.0,
+            zsq_sign_t: 0.0,
             pos_hist: VecDeque::new(),
             unstick_until: -1.0,
             unstick_dir: [1.0, 0.0],
@@ -877,6 +892,21 @@ impl Brain {
             let m = (cr * 0.12).clamp(8.0, 40.0);
             (cc, (cr - m).max(2.0), urgent_cur)
         }
+    }
+
+    /// Zone-squeeze context: (inward-direction center, boundary center, boundary radius) while the
+    /// zone is hurting or small, else None. Off at low HP and in the last tiny circle.
+    fn zsq_ctx(&self, z: &Zone, t: f32, hp_frac: f32) -> Option<([f32; 2], [f32; 2], f32)> {
+        if self.prm.zsq < 0.5 || hp_frac < 0.25 {
+            return None;
+        }
+        let shrinking = t > z.shrink_start;
+        let (cc, cr) = if shrinking { Self::zone_now(z, t) } else { (z.center, z.radius) };
+        if !(z.dps >= 60.0 || (shrinking && cr <= 140.0)) || cr <= 25.0 {
+            return None;
+        }
+        let dc = if shrinking { z.next_center } else { cc };
+        Some((dc, cc, cr))
     }
 
     fn clamp_into(p: [f32; 2], c: [f32; 2], r: f32) -> [f32; 2] {
@@ -1331,6 +1361,7 @@ impl Brain {
 
         // ---- zone
         let (gc, gr, zone_urgent) = self.goal_circle(obs, walk);
+        let zsq = self.zsq_ctx(&obs.zone, obs.t, hp_frac);
 
         // ---- enemies
         let enemies: Vec<&Mech> = obs.mechs.iter().filter(|m| m.is_mech() && m.id != me.id).collect();
@@ -1355,6 +1386,13 @@ impl Brain {
             s -= dmg_by(m.id, &self.dmg_log) * 0.25;
             if Some(m.id) == self.target_id {
                 s -= 30.0;
+            }
+            if let Some((_, bc, br)) = zsq {
+                let gap = br - dist2(xy(m.pos), bc);
+                let outward = (m.pos[0] - pos[0]) * (m.pos[0] - bc[0]) + (m.pos[1] - pos[1]) * (m.pos[1] - bc[1]) > 0.0;
+                if outward {
+                    s -= self.prm.zsq_c * (1.0 - gap / 60.0).clamp(0.0, 1.0);
+                }
             }
             // Laser cook-off: +60% to mortar carriers.
             if self.prm.lcook > 0.0 && m.has("mortar") && me.weapons.iter().flatten().any(|w| w.kind == "laser") {
@@ -1804,10 +1842,29 @@ impl Brain {
                     mv = if dist2(sp, p2) > 2.0 { self.goto(p2, sp) } else { [0.0, 0.0] };
                 } else if !shootable {
                     // Go find a line on it (or wait at a corner when it is a sniper).
-                    mv = self.goto(p2, xy(m.pos));
+                    let mut gl = xy(m.pos);
+                    if let Some((_, bc, br)) = zsq {
+                        gl = Self::clamp_into(gl, bc, (br - self.prm.zsq_in).max(2.0));
+                    }
+                    mv = self.goto(p2, gl);
                     want_boost = d > 60.0;
                 } else {
                     let b = yaw_to(p2, xy(m.pos));
+                    if let Some((_, bc, br)) = zsq {
+                        // Orbit toward the center when the target is closer to the edge than we are.
+                        let zm = br - dist2(p2, bc);
+                        let em = br - dist2(xy(m.pos), bc);
+                        if em < zm && obs.t > self.zsq_sign_t {
+                            let pb = [-b.sin(), b.cos()];
+                            let ic = [bc[0] - p2[0], bc[1] - p2[1]];
+                            let dotp = pb[0] * ic[0] + pb[1] * ic[1];
+                            if dotp.abs() > 1.0 {
+                                self.strafe_sign = if dotp > 0.0 { 1.0 } else { -1.0 };
+                                self.zsq_sign_t = obs.t + 0.8;
+                                self.strafe_switch_t = self.strafe_switch_t.max(obs.t + 0.8);
+                            }
+                        }
+                    }
                     let perp = [-b.sin() * self.strafe_sign, b.cos() * self.strafe_sign];
                     let radial = if d > hi {
                         1.0
@@ -1824,6 +1881,24 @@ impl Brain {
                         let c = [others.iter().map(|o| o[0]).sum::<f32>() / n, others.iter().map(|o| o[1]).sum::<f32>() / n];
                         let away = unit2([p2[0] - c[0], p2[1] - c[1]]);
                         cand = unit2([cand[0] + away[0] * self.prm.kite, cand[1] + away[1] * self.prm.kite]);
+                    }
+                    if let Some((dc, bc, br)) = zsq {
+                        let zm = br - dist2(p2, bc);
+                        let w = self.prm.zsq_w * ((60.0 - zm) / 60.0).clamp(0.0, 1.0);
+                        let ind = unit2([dc[0] - p2[0], dc[1] - p2[1]]);
+                        cand = unit2([cand[0] + ind[0] * w, cand[1] + ind[1] * w]);
+                        // Hard guard: never walk out of the circle's inner margin.
+                        let nxt = [p2[0] + cand[0] * 6.0, p2[1] + cand[1] * 6.0];
+                        if dist2(nxt, bc) > br - self.prm.zsq_in {
+                            let o = unit2([p2[0] - bc[0], p2[1] - bc[1]]);
+                            let dp = cand[0] * o[0] + cand[1] * o[1];
+                            if dp > 0.0 {
+                                cand = unit2([cand[0] - o[0] * dp, cand[1] - o[1] * dp]);
+                            }
+                            if dist2(p2, bc) > br - self.prm.zsq_in {
+                                cand = unit2([cand[0] + ind[0], cand[1] + ind[1]]);
+                            }
+                        }
                     }
                     if let Some(sp) = hold_here {
                         let nxt = [p2[0] + cand[0] * 4.0, p2[1] + cand[1] * 4.0];
@@ -2541,7 +2616,16 @@ impl Brain {
                 let sp = mw.stat("speed", 72.0);
                 let g = mw.stat("gravity", self.gravity);
                 let tube = [pos[0], pos[1], pos[2] + statf(me, "height", 9.0) + 0.5];
-                let mut tp = tg.pos;
+                let mut sh = [0.0f32; 3];
+                if let Some((_, bc, br)) = self.zsq_ctx(&obs.zone, obs.t, me.hp / me.max_hp.max(1.0)) {
+                    let tc = xy(tg.pos);
+                    let dd = dist2(tc, bc);
+                    if br - dd < 12.0 && dd > 1.0 {
+                        let k = 4.0 / dd;
+                        sh = [(bc[0] - tc[0]) * k, (bc[1] - tc[1]) * k, 0.0];
+                    }
+                }
+                let mut tp = add(tg.pos, sh);
                 let mut sol = None;
                 for _ in 0..3 {
                     let dd = hdist(tp, tube) - 3.0;
@@ -2549,7 +2633,7 @@ impl Brain {
                     let maxp = statf(me, "max_pitch", 1.3) - 0.02;
                     sol = ballistic(dd, h, sp, g, !los).filter(|s| s.0 <= maxp).or_else(|| ballistic(dd, h, sp, g, false));
                     if let Some((_, tf)) = sol {
-                        tp = add(tg.pos, scale([tg.vel[0], tg.vel[1], 0.0], tf + 0.05));
+                        tp = add(add(tg.pos, sh), scale([tg.vel[0], tg.vel[1], 0.0], tf + 0.05));
                     }
                 }
                 if let Some((pitch, _)) = sol {
