@@ -318,6 +318,8 @@ pub struct Params {
     pub zsq_w: f32,
     pub zsq_c: f32,
     pub zsq_in: f32,
+    pub zsq_dps: f32,
+    pub zsq_r: f32,
 }
 
 impl Default for Params {
@@ -395,6 +397,8 @@ impl Default for Params {
             zsq_w: 0.6,
             zsq_c: 40.0,
             zsq_in: 10.0,
+            zsq_dps: 60.0,
+            zsq_r: 140.0,
         }
     }
 }
@@ -480,6 +484,8 @@ impl Params {
                     "zsq_w" => p.zsq_w = x,
                     "zsq_c" => p.zsq_c = x,
                     "zsq_in" => p.zsq_in = x,
+                    "zsq_dps" => p.zsq_dps = x,
+                    "zsq_r" => p.zsq_r = x,
                     _ => eprintln!("unknown param {k}"),
                 }
             }
@@ -902,7 +908,7 @@ impl Brain {
         }
         let shrinking = t > z.shrink_start;
         let (cc, cr) = if shrinking { Self::zone_now(z, t) } else { (z.center, z.radius) };
-        if !(z.dps >= 60.0 || (shrinking && cr <= 140.0)) || cr <= 25.0 {
+        if !(z.dps >= self.prm.zsq_dps || (shrinking && cr <= self.prm.zsq_r)) || cr <= 25.0 {
             return None;
         }
         let dc = if shrinking { z.next_center } else { cc };
