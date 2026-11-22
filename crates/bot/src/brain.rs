@@ -386,7 +386,7 @@ impl Default for Params {
             mclus: 0.0,
             lcook: 0.0,
             noret: 1.0,
-            rl: 0.0,
+            rl: 1.0,
             memt: 0.0,
             nlr: 2.0,
             nlr_t: 90.0,
