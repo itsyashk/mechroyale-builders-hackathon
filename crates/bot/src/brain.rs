@@ -312,6 +312,8 @@ pub struct Params {
     pub nlr: f32,
     pub nlr_t: f32,
     pub nlr_d: f32,
+    /// Lightning purity: do not zap when a nearer crate/NPC sits in the arc cone; swing the cone off it.
+    pub lp: f32,
 }
 
 impl Default for Params {
@@ -385,6 +387,7 @@ impl Default for Params {
             nlr: 2.0,
             nlr_t: 90.0,
             nlr_d: 35.0,
+            lp: 0.0,
         }
     }
 }
@@ -466,6 +469,7 @@ impl Params {
                     "nlr" => p.nlr = x,
                     "nlr_t" => p.nlr_t = x,
                     "nlr_d" => p.nlr_d = x,
+                    "lp" => p.lp = x,
                     _ => eprintln!("unknown param {k}"),
                 }
             }
@@ -2518,7 +2522,40 @@ impl Brain {
             let cone = lw.stat("cone_deg", 30.0).to_radians() * 0.5;
             let cost = lw.stat("energy", 3.0);
             let yaw_err = wrap(cur_aim[0] - yaw_to(xy(pos), xy(tg.pos))).abs();
-            if hdist(tg.pos, pos) < range * 0.93 && yaw_err < cone * 0.8 && los && me.energy >= cost + 1.0 && lw.cooldown <= 0.05 && allow {
+            let mut want = hdist(tg.pos, pos) < range * 0.93 && yaw_err < cone * 0.8 && los && me.energy >= cost + 1.0 && lw.cooldown <= 0.05 && allow;
+            if self.prm.lp > 0.0 && matches!(tg.kind, TargetKind::Mech) && hdist(tg.pos, pos) < range {
+                // Junk = npcs and crates. The arc takes the nearest valid thing in the cone.
+                let td = len3(sub(center, muzzle));
+                let junk: Vec<V3> = obs
+                    .mechs
+                    .iter()
+                    .filter(|m| m.kind == "npc")
+                    .map(|m| [m.pos[0], m.pos[1], m.pos[2] + 1.75])
+                    .chain(obs.crates.iter().map(|c| [c.pos[0], c.pos[1], c.pos[2] + 1.2]))
+                    .filter(|j| hdist(*j, pos) < range && len3(sub(*j, muzzle)) < td)
+                    .filter(|j| self.world.los(muzzle, *j))
+                    .collect();
+                if !junk.is_empty() {
+                    let in_cone = |yaw: f32, j: &V3| wrap(yaw - yaw_to(xy(pos), xy(*j))).abs() < cone;
+                    let ty = yaw_to(xy(pos), xy(tg.pos));
+                    if junk.iter().any(|j| in_cone(cur_aim[0], j)) {
+                        want = false;
+                    }
+                    // Swing the cone off the junk while keeping the target inside, only when no
+                    // shot is committed to the shared aim this tick.
+                    let gun_idle = gun.map(|g| w(g).reload.unwrap_or(0.0) > 0.0 || w(g).ammo.unwrap_or(1.0) <= 0.0).unwrap_or(true);
+                    if !fire.iter().any(|f| *f) && gun_idle {
+                        for k in [0.0f32, 0.5, -0.5, 0.8, -0.8] {
+                            let y = ty + k * cone;
+                            if !junk.iter().any(|j| in_cone(y, j)) {
+                                aim[0] = y;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if want {
                 fire[li] = true;
             }
             if gun_aim.is_none() && laser.is_none() {
