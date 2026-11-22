@@ -1440,6 +1440,7 @@ impl Brain {
         let dsk_hunter_near = enemies.iter().any(|m| hdist(m.pos, pos) < 100.0)
             || self.tracks.values().any(|t| obs.t - t.seen_t < 3.0 && hdist(t.pos, pos) < 100.0);
         // Slot to give up for a missing special: Some(None) = free slot, Some(Some(i)) = swap slot i, None = not allowed.
+        let dsk_dg = self.prm.dsk_dg > 0.5;
         let dsk_drop = |kind: &str| -> Option<Option<usize>> {
             if slot_kind(0).is_empty() || slot_kind(1).is_empty() {
                 return Some(None);
@@ -1450,7 +1451,7 @@ impl Brain {
                 }
             }
             let gi = if slot_kind(0) == "gun" { 0 } else if slot_kind(1) == "gun" { 1 } else { return None };
-            if self.prm.dsk_dg > 0.5 && me.cubes >= 1 && !dsk_hunter_near {
+            if dsk_dg && me.cubes >= 1 && !dsk_hunter_near {
                 return Some(Some(gi));
             }
             if kind == "laser" {
