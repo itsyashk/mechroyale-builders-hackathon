@@ -148,6 +148,10 @@ pub struct Brain {
     strafe_sign: f32,
     strafe_switch_t: f32,
     pos_hist: VecDeque<(f32, [f32; 2], bool)>,
+    /// Apex-release state: hold start time (-1 = none), previous (t, target id, lateral speed), counters [apex, timeout, skipped].
+    lzx_t0: f32,
+    lzx_prev: (f32, i64, f32),
+    lzx_n: [u32; 3],
     unstick_until: f32,
     unstick_dir: [f32; 2],
     last_dmg_t: f32,
@@ -301,6 +305,9 @@ pub struct Params {
     pub lcov: f32,
     /// >0: release a full charge held this long (s) toward the target instead of letting it auto-fire.
     pub lhold: f32,
+    /// 1 = hold a full laser charge (up to lzx_wait s) and release at the target's lateral-velocity apex.
+    pub lzx: f32,
+    pub lzx_wait: f32,
     /// Mortar slow/clustered targets even with a working gun in LOS.
     pub mclus: f32,
     /// Target-score bonus (m) for mortar carriers while we hold a laser (cook-off).
@@ -378,6 +385,8 @@ impl Default for Params {
             lupg: 0.0,
             lcov: 1.0,
             lhold: 0.0,
+            lzx: 0.0,
+            lzx_wait: 0.5,
             mclus: 0.0,
             lcook: 0.0,
             noret: 1.0,
@@ -459,6 +468,8 @@ impl Params {
                     "lupg" => p.lupg = x,
                     "lcov" => p.lcov = x,
                     "lhold" => p.lhold = x,
+                    "lzx" => p.lzx = x,
+                    "lzx_wait" => p.lzx_wait = x,
                     "mclus" => p.mclus = x,
                     "lcook" => p.lcook = x,
                     "noret" => p.noret = x,
@@ -590,6 +601,9 @@ impl Brain {
             strafe_sign: 1.0,
             strafe_switch_t: 0.0,
             pos_hist: VecDeque::new(),
+            lzx_t0: -1.0,
+            lzx_prev: (-1.0, -1, 0.0),
+            lzx_n: [0; 3],
             unstick_until: -1.0,
             unstick_dir: [1.0, 0.0],
             last_dmg_t: -100.0,
@@ -772,6 +786,7 @@ impl Brain {
         eprintln!("end: {raw} gunstat[mech_ticks,fire,nolos,range,ammo/reload,aim,hold]={:?} sniper[peek,hide,nopair,_]={:?}", self.gstat, self.sn_stat);
         if self.ws.on {
             let w = &self.ws;
+            eprintln!("lzx: apex={} timeout={} skipped={}", self.lzx_n[0], self.lzx_n[1], self.lzx_n[2]);
             eprintln!(
                 "wstat: {{\"t\":{:.1},\"laser_t\":{:.1},\"w2_t\":{:.1},\"takes\":{:?},\"dmg_m\":[{:.0},{:.0},{:.0},{:.0}],\"dmg_o\":[{:.0},{:.0},{:.0},{:.0}],\"l_hits_m\":{},\"l_hits_o\":{},\"l_rel\":{},\"l_rel_m\":{},\"l_partial\":{},\"l_held\":{},\"l_rel_nolos\":{},\"l_charge_sum\":{:.2},\"ch_ticks\":{},\"ch_nolos\":{},\"ch_notgt\":{},\"shorted\":{},\"full_sum\":{}}}",
                 self.t, w.laser_t, w.first_w2_t, w.takes, w.dmg_m[0], w.dmg_m[1], w.dmg_m[2], w.dmg_m[3], w.dmg_o[0], w.dmg_o[1], w.dmg_o[2], w.dmg_o[3],
@@ -2452,6 +2467,9 @@ impl Brain {
             // onto the hitscan line just before the charge is full.
             let gun_live = gun.map(|g| w(g).ammo.unwrap_or(1.0) > 0.0 && w(g).reload.unwrap_or(0.0) <= 0.0).unwrap_or(false) && los && allow;
             let swing = |ga: [f32; 2]| wrap(ga[0] - direct[0]).abs().max((ga[1] - direct[1]).abs()) / 3.0 + 0.1;
+            if charge <= 0.0 {
+                self.lzx_t0 = -1.0;
+            }
             if charge > 0.0 {
                 aim = direct;
                 if self.prm.chg_gun > 0.0 && gun_live {
@@ -2464,6 +2482,43 @@ impl Brain {
                 let ready = charge >= full * self.prm.lrel.min(1.0) - 0.03;
                 if ready && los && aligned(direct) {
                     fire[li] = false; // release
+                    if self.prm.lzx > 0.0 {
+                        // Lateral speed of the target across the beam (horizontal).
+                        let bx = center[0] - muzzle[0];
+                        let by = center[1] - muzzle[1];
+                        let bl = (bx * bx + by * by).sqrt().max(1e-3);
+                        let vlat = (tg.vel[0] * (-by) + tg.vel[1] * bx) / bl;
+                        let (pt, pid, pv) = self.lzx_prev;
+                        let dt = obs.t - pt;
+                        let have_prev = pid == tg.id && dt > 0.01 && dt < 0.35;
+                        let accel = if have_prev { (vlat - pv) / dt } else { 0.0 };
+                        self.lzx_prev = (obs.t, tg.id, vlat);
+                        if self.lzx_t0 < 0.0 {
+                            self.lzx_t0 = obs.t;
+                        }
+                        let waited = obs.t - self.lzx_t0;
+                        let crowd = self.tracks.iter().any(|(id, t)| *id != tg.id && obs.t - t.seen_t < 0.5 && hdist(t.pos, pos) < 80.0);
+                        let tried = self.lzx_n[0] + self.lzx_n[1];
+                        let broken = tried >= 10 && self.lzx_n[1] as f32 > 0.7 * tried as f32;
+                        if d < 60.0 || crowd || broken {
+                            if waited < 0.01 {
+                                self.lzx_n[2] += 1;
+                            }
+                        } else {
+                            let apex = vlat.abs() < 2.5
+                                || (have_prev && vlat.abs() < pv.abs() && (vlat + accel * 0.1).abs() < 1.5);
+                            if apex {
+                                self.lzx_n[0] += 1;
+                            } else if waited >= self.prm.lzx_wait {
+                                self.lzx_n[1] += 1;
+                            } else {
+                                fire[li] = true; // keep holding the full charge
+                            }
+                        }
+                        if !fire[li] {
+                            self.lzx_t0 = -1.0;
+                        }
+                    }
                 } else {
                     fire[li] = true;
                 }
