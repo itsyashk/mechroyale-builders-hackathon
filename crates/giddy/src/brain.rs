@@ -126,7 +126,7 @@ pub struct Params {
 
 /// Baked-in tuning overrides ("k=v,k=v"), applied on top of both the base and the
 /// practice-mode parameters. Bools take 1/0.
-pub const OVERRIDES: &str = "";
+pub const OVERRIDES: &str = "retreat_hp=0.25";
 /// Perturbs only the bot's RNG seed, for independent draws of the same strategy.
 pub const SALT: u64 = 0;
 
