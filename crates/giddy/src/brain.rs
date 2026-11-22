@@ -128,7 +128,7 @@ pub struct Params {
 /// practice-mode parameters. Bools take 1/0.
 pub const OVERRIDES: &str = "";
 /// Perturbs only the bot's RNG seed, for independent draws of the same strategy.
-pub const SALT: u64 = 0;
+pub const SALT: u64 = 2;
 
 pub fn apply_overrides(p: &mut Params) {
     for kv in OVERRIDES.split(',') {
