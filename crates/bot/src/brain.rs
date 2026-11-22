@@ -393,7 +393,7 @@ impl Default for Params {
             mclus: 0.0,
             lcook: 0.0,
             noret: 1.0,
-            sph: 0.0,
+            sph: 1.0,
             sph_cv: 0.35,
             sph_skip: 1.0,
             memt: 0.0,
